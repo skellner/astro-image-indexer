@@ -10,6 +10,9 @@ interface Props {
 export function DetailPanel({ image, onClose }: Props) {
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [showRaw, setShowRaw] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   useEffect(() => {
     setDetail(null);
@@ -17,6 +20,15 @@ export function DetailPanel({ image, onClose }: Props) {
       .then((d) => setDetail(d as unknown as ImageDetail))
       .catch(console.error);
   }, [image.id]);
+
+  useEffect(() => {
+    setPreviewUrl(null);
+    setPreviewError(null);
+    setPreviewLoading(true);
+    invoke<string>("get_image_preview", { filePath: image.file_path })
+      .then((url) => { setPreviewUrl(url); setPreviewLoading(false); })
+      .catch((e) => { setPreviewError(String(e)); setPreviewLoading(false); });
+  }, [image.file_path]);
 
   return (
     <div className="w-80 shrink-0 bg-gray-900 border-l border-gray-700 flex flex-col h-full">
@@ -30,6 +42,24 @@ export function DetailPanel({ image, onClose }: Props) {
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 space-y-4 text-sm">
+        {previewLoading && (
+          <div className="flex items-center justify-center h-32 bg-gray-800 rounded text-xs text-gray-500">
+            Loading preview…
+          </div>
+        )}
+        {previewUrl && (
+          <img
+            src={previewUrl}
+            alt="Preview"
+            className="w-full rounded border border-gray-700"
+            style={{ imageRendering: "pixelated" }}
+          />
+        )}
+        {previewError && !previewLoading && (
+          <div className="flex items-center justify-center h-16 bg-gray-800 rounded text-xs text-gray-600 italic px-2 text-center">
+            Preview unavailable
+          </div>
+        )}
         <Section title="Target">
           <Row label="Object" value={image.object_name} />
           <Row label="RA" value={detail?.ra != null ? `${detail.ra.toFixed(5)}°` : null} />

@@ -2,6 +2,7 @@ mod db;
 mod fits;
 mod indexer;
 mod metadata;
+mod preview;
 mod queries;
 mod xisf;
 
@@ -47,6 +48,7 @@ pub fn run() {
             queries::get_library_stats,
             queries::get_filter_options,
             queries::get_object_options,
+            preview::get_image_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

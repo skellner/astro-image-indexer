@@ -15,7 +15,8 @@
       "Bash(cmd /c \"taskkill /IM tauri-app.exe /F & taskkill /IM node.exe /F\")",
       "Bash(powershell -Command \"Stop-Process -Name ''tauri-app'' -Force -ErrorAction SilentlyContinue; Stop-Process -Name ''node'' -Force -ErrorAction SilentlyContinue; Write-Host ''done''\")",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(cargo clippy:*)"
     ]
   }
 }
