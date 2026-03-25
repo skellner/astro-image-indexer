@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// Normalize raw FITS/XISF IMAGETYP strings to canonical values.
+pub fn normalize_image_type(raw: &str) -> String {
+    match raw.trim().to_lowercase().as_str() {
+        "light" | "light frame" | "lights" | "science" => "Light".into(),
+        "dark" | "dark frame" | "darks" => "Dark".into(),
+        "flat" | "flat frame" | "flats" | "sky flat" | "flat field" => "Flat".into(),
+        "bias" | "bias frame" | "offset" | "offset frame" => "Bias".into(),
+        "master dark" | "masterdark" => "MasterDark".into(),
+        "master flat" | "masterflat" => "MasterFlat".into(),
+        "master bias" | "masterbias" | "master offset" => "MasterBias".into(),
+        _ => raw.trim().to_string(),
+    }
+}
+
 /// Parsed metadata from a FITS or XISF file.
 /// All fields are optional — not every file will have every keyword.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

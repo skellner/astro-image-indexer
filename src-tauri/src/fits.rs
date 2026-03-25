@@ -165,7 +165,7 @@ fn extract_metadata(raw: &HashMap<String, String>, path: &Path) -> ImageMetadata
 
     ImageMetadata {
         format: "FITS".into(),
-        image_type: get(&["IMAGETYP", "FRAME"]),
+        image_type: get(&["IMAGETYP", "FRAME"]).map(|s| crate::metadata::normalize_image_type(&s)),
         object_name: get(&["OBJECT", "TARGET"]),
         ra,
         dec,

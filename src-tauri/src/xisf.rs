@@ -271,7 +271,7 @@ fn extract_metadata(
 
     ImageMetadata {
         format: "XISF".into(),
-        image_type: get_raw(&["IMAGETYP", "FRAME"]),
+        image_type: get_raw(&["IMAGETYP", "FRAME"]).map(|s| crate::metadata::normalize_image_type(&s)),
         object_name,
         ra: get_f64(&["RA", "OBJCTRA"]),
         dec: get_f64(&["DEC", "OBJCTDEC"]),

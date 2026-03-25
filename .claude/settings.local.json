@@ -6,7 +6,16 @@
       "Bash(cargo check:*)",
       "Bash(npm install:*)",
       "Bash(npx tsc:*)",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "Bash(netstat -ano)",
+      "Bash(npm run:*)",
+      "Bash(git push:*)",
+      "Bash(taskkill /IM \"tauri-app.exe\" /F)",
+      "Bash(taskkill /IM \"node.exe\" /F)",
+      "Bash(cmd /c \"taskkill /IM tauri-app.exe /F & taskkill /IM node.exe /F\")",
+      "Bash(powershell -Command \"Stop-Process -Name ''tauri-app'' -Force -ErrorAction SilentlyContinue; Stop-Process -Name ''node'' -Force -ErrorAction SilentlyContinue; Write-Host ''done''\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
     ]
   }
 }

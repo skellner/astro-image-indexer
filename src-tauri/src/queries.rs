@@ -104,7 +104,7 @@ pub fn list_images(
     }
     if let Some(ref t) = image_type {
         if !t.is_empty() {
-            conditions.push("image_type = ?".into());
+            conditions.push("LOWER(image_type) = LOWER(?)".into());
             values.push(Box::new(t.clone()));
         }
     }

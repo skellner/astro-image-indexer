@@ -8,7 +8,7 @@ interface Props {
   onFilterNameChange: (v: string) => void;
 }
 
-const IMAGE_TYPES = ["", "Light Frame", "Dark Frame", "Flat Frame", "Bias Frame"];
+const IMAGE_TYPES = ["Light", "Dark", "Flat", "Bias", "MasterDark", "MasterFlat", "MasterBias"];
 
 export function FilterBar({
   search,
