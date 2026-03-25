@@ -5,6 +5,7 @@ import { DetailPanel } from "./components/DetailPanel";
 import { FilterBar } from "./components/FilterBar";
 import { ImageTable } from "./components/ImageTable";
 import { Sidebar } from "./components/Sidebar";
+import { TopBar } from "./components/TopBar";
 import { ScanProgressBar } from "./components/ScanProgress";
 import {
   DirectoryEntry,
@@ -49,17 +50,9 @@ export default function App() {
     setImages(rows);
   }, [search, imageType, filterName]);
 
-  // Initial load
-  useEffect(() => {
-    refreshDirs();
-  }, [refreshDirs]);
+  useEffect(() => { refreshDirs(); }, [refreshDirs]);
+  useEffect(() => { refreshImages(); }, [refreshImages]);
 
-  // Re-query when filters change
-  useEffect(() => {
-    refreshImages();
-  }, [refreshImages]);
-
-  // Listen for scan progress events from Rust
   useEffect(() => {
     const unlisten = listen<ScanProgress>("indexer://progress", (e) => {
       setProgress(e.payload);
@@ -89,7 +82,7 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-screen bg-gray-950 text-gray-200 overflow-hidden">
+    <div className="flex flex-col h-screen bg-gray-950 text-gray-200 overflow-hidden">
       <ScanProgressBar
         scanning={scanning}
         progress={progress}
@@ -97,39 +90,41 @@ export default function App() {
         onDismiss={() => setLastResult(null)}
         onCancel={handleCancel}
       />
-      <Sidebar
-        dirs={dirs}
+      <TopBar
         stats={stats}
+        dirs={dirs}
         scanning={scanning}
         onDirsChange={refreshDirs}
         onScanStart={handleScanStart}
         onScanEnd={handleScanEnd}
       />
-
-      <div className="flex flex-col flex-1 min-w-0">
-        <FilterBar
-          search={search}
-          imageType={imageType}
-          filterName={filterName}
-          filterOptions={filterOptions}
-          onSearchChange={setSearch}
-          onImageTypeChange={setImageType}
-          onFilterNameChange={setFilterName}
-        />
-        <div className="flex items-center justify-between px-4 py-1.5 border-b border-gray-800">
-          <span className="text-xs text-gray-500">
-            {images.length} image{images.length !== 1 ? "s" : ""}
-          </span>
-        </div>
-        <div className="flex flex-1 min-h-0">
-          <ImageTable
-            images={images}
-            onSelect={setSelected}
-            selectedId={selected?.id ?? null}
+      <div className="flex flex-1 min-h-0">
+        <Sidebar dirs={dirs} onDirsChange={refreshDirs} />
+        <div className="flex flex-col flex-1 min-w-0">
+          <FilterBar
+            search={search}
+            imageType={imageType}
+            filterName={filterName}
+            filterOptions={filterOptions}
+            onSearchChange={setSearch}
+            onImageTypeChange={setImageType}
+            onFilterNameChange={setFilterName}
           />
-          {selected && (
-            <DetailPanel image={selected} onClose={() => setSelected(null)} />
-          )}
+          <div className="flex items-center px-4 py-1.5 border-b border-gray-800">
+            <span className="text-xs text-gray-500">
+              {images.length} image{images.length !== 1 ? "s" : ""}
+            </span>
+          </div>
+          <div className="flex flex-1 min-h-0">
+            <ImageTable
+              images={images}
+              onSelect={setSelected}
+              selectedId={selected?.id ?? null}
+            />
+            {selected && (
+              <DetailPanel image={selected} onClose={() => setSelected(null)} />
+            )}
+          </div>
         </div>
       </div>
     </div>
