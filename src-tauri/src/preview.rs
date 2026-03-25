@@ -31,10 +31,20 @@ pub async fn get_image_preview(file_path: String) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared pixel buffer
+// ---------------------------------------------------------------------------
+
+pub struct PixelBuffer {
+    pub pixels: Vec<f32>,
+    pub width: usize,
+    pub height: usize,
+}
+
+// ---------------------------------------------------------------------------
 // FITS
 // ---------------------------------------------------------------------------
 
-fn load_fits_preview(path: &Path) -> Result<String, String> {
+pub(crate) fn load_fits_pixels(path: &Path) -> Result<PixelBuffer, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
 
     let mut bitpix: i32 = 16;
@@ -78,7 +88,12 @@ fn load_fits_preview(path: &Path) -> Result<String, String> {
 
     let n_pixels = naxis1 * naxis2;
     let pixels = read_fits_pixels(&mut file, bitpix, n_pixels, bzero, bscale)?;
-    stretch_and_encode(&pixels, naxis1, naxis2)
+    Ok(PixelBuffer { pixels, width: naxis1, height: naxis2 })
+}
+
+fn load_fits_preview(path: &Path) -> Result<String, String> {
+    let buf = load_fits_pixels(path)?;
+    stretch_and_encode(&buf.pixels, buf.width, buf.height)
 }
 
 fn fits_card_value<'a>(card: &'a str, key: &str) -> Option<&'a str> {
@@ -152,7 +167,7 @@ fn read_fits_pixels(
 // XISF
 // ---------------------------------------------------------------------------
 
-fn load_xisf_preview(path: &Path) -> Result<String, String> {
+pub(crate) fn load_xisf_pixels(path: &Path) -> Result<PixelBuffer, String> {
     const MAGIC: &[u8; 8] = b"XISF0100";
 
     let mut file = File::open(path).map_err(|e| e.to_string())?;
@@ -213,7 +228,12 @@ fn load_xisf_preview(path: &Path) -> Result<String, String> {
 
     // For multi-channel images take only the first channel (first width*height samples)
     let pixels = fmt.decode(&raw, n_pixels)?;
-    stretch_and_encode(&pixels, width, height)
+    Ok(PixelBuffer { pixels, width, height })
+}
+
+fn load_xisf_preview(path: &Path) -> Result<String, String> {
+    let buf = load_xisf_pixels(path)?;
+    stretch_and_encode(&buf.pixels, buf.width, buf.height)
 }
 
 /// Undo XISF byte-shuffle: input is [byte0 of all items, byte1 of all items, …],

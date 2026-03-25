@@ -3,6 +3,7 @@ mod fits;
 mod indexer;
 mod metadata;
 mod preview;
+mod quality;
 mod queries;
 mod xisf;
 

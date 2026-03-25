@@ -14,6 +14,8 @@ use walkdir::WalkDir;
 
 use crate::fits;
 use crate::metadata::ImageMetadata;
+use crate::preview;
+use crate::quality;
 use crate::xisf;
 use crate::AppState;
 
@@ -252,11 +254,26 @@ fn process_file(path: &Path, conn: &Connection) -> Result<bool, String> {
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let (meta, raw) = match ext.as_str() {
+    let (mut meta, raw) = match ext.as_str() {
         "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
         "xisf" => xisf::parse(path).map_err(|e| e.to_string())?,
         _ => return Err(format!("Unsupported extension: {ext}")),
     };
+
+    // For light frames, read pixel data and compute FWHM + star count.
+    // Errors are silently ignored — the file is still indexed without quality data.
+    if meta.image_type.as_deref() == Some("Light") {
+        let pixel_result = match ext.as_str() {
+            "fits" | "fit" => preview::load_fits_pixels(path),
+            _ => preview::load_xisf_pixels(path),
+        };
+        if let Ok(buf) = pixel_result {
+            if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
+                meta.fwhm = Some(fwhm);
+                meta.star_count = Some(count);
+            }
+        }
+    }
 
     upsert_image(conn, path, file_size, file_modified, hash, &meta)?;
     upsert_raw_headers(conn, path, &raw)?;
