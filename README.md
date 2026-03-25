@@ -10,6 +10,7 @@ A Tauri 2 desktop application for Windows that scans local directories, parses m
 - Full-text search and filtering by object name, image type, and filter
 - Sortable image table with quality indicators
 - **Image preview** — auto-stretched grayscale thumbnail in the detail panel (FITS and XISF, including LZ4/LZ4+sh-compressed files)
+- **Automatic quality analysis** — FWHM and star count computed for every light frame during scanning; stored in the database and shown in the detail panel
 - Raw header/property storage for arbitrary ad-hoc queries
 - Library statistics (total images, unique objects/filters, total exposure hours)
 - Non-blocking async scanning with a cancellable progress popup
@@ -78,7 +79,8 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `xisf.rs` | XISF XML header parser |
 | `indexer.rs` | Async directory walk, SHA-256 hashing, database writes, throttled progress events, cancel flag |
 | `queries.rs` | Tauri command handlers for search, filter, and stats queries |
-| `preview.rs` | Async image preview: reads raw pixel data, auto-stretch, PNG encode, base64 |
+| `preview.rs` | Pixel reading (`load_fits_pixels`, `load_xisf_pixels`) + async preview command (stretch, PNG encode, base64) |
+| `quality.rs` | Star detection and FWHM measurement on a center 2048×2048 crop |
 
 ### Frontend Components
 
@@ -202,6 +204,18 @@ XISF properties mapped: `Observation:Object:Name`, `Observation:Time:Start`, `In
 ### Image Preview
 
 `preview.rs` implements `get_image_preview`: reads raw pixel data from FITS or XISF, applies a median+MAD auto-stretch with a square-root tone curve, downsamples to max 800×600, and returns a base64-encoded PNG data URL. Handles LZ4 and LZ4+byte-shuffle compressed XISF blocks (the default output of N.I.N.A.).
+
+### Quality Analysis (FWHM and Star Count)
+
+`quality.rs` runs automatically for every light frame during scanning:
+
+1. **Crop** — extracts the center 2048×2048 region to limit analysis cost on large sensors
+2. **Background** — estimates sky level (median) and noise (MAD × 1.4826)
+3. **Detection** — finds local maxima above a 10σ threshold using a 5×5 neighborhood window
+4. **FWHM** — for each candidate, walks outward in four axis-aligned directions to the half-maximum level; uses linear interpolation for sub-pixel accuracy; rejects stars with FWHM outside [1.5, 25] px
+5. **Output** — median FWHM in pixels and star count, written to `images.fwhm` / `images.star_count`
+
+Pixel-read errors are silently swallowed so metadata is always indexed even if the pixel data cannot be loaded.
 
 ## Key Dependencies
 
