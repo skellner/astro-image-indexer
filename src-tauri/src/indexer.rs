@@ -235,17 +235,44 @@ fn process_file(path: &Path, conn: &Connection) -> Result<bool, String> {
 
     let hash = sha256_file(path).map_err(|e| e.to_string())?;
 
-    // Skip if already indexed with the same hash
-    let existing_hash: Option<String> = conn
+    // Check existing record: hash, image_type, and whether quality data exists
+    let existing: Option<(String, Option<String>, Option<f64>)> = conn
         .query_row(
-            "SELECT file_hash FROM images WHERE file_path = ?1",
+            "SELECT file_hash, image_type, fwhm FROM images WHERE file_path = ?1",
             params![path.to_string_lossy().as_ref()],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .ok();
 
-    if existing_hash.as_deref() == Some(&hash) {
-        return Ok(false);
+    if let Some((ref existing_hash, ref existing_type, ref existing_fwhm)) = existing {
+        if existing_hash == &hash {
+            // File unchanged. Skip unless it's a light frame that still needs quality data.
+            let needs_quality = existing_type.as_deref() == Some("Light") && existing_fwhm.is_none();
+            if !needs_quality {
+                return Ok(false);
+            }
+
+            // Light frame with no quality data yet: compute and update, then return.
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+            let pixel_result = match ext.as_str() {
+                "fits" | "fit" => preview::load_fits_pixels(path),
+                _ => preview::load_xisf_pixels(path),
+            };
+            if let Ok(buf) = pixel_result {
+                if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
+                    conn.execute(
+                        "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
+                        params![fwhm, count, path.to_string_lossy().as_ref()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(true);
+        }
     }
 
     let ext = path
@@ -350,6 +377,11 @@ fn upsert_image(
             height          = excluded.height,
             bit_depth       = excluded.bit_depth,
             software        = excluded.software,
+            fwhm            = excluded.fwhm,
+            star_count      = excluded.star_count,
+            eccentricity    = excluded.eccentricity,
+            snr             = excluded.snr,
+            sky_background  = excluded.sky_background,
             indexed_at      = excluded.indexed_at,
             parse_error     = NULL",
         params![
