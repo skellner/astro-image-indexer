@@ -9,6 +9,7 @@ A Tauri 2 desktop application for Windows that scans local directories, parses m
 - SHA-256 deduplication — unchanged files are skipped on rescan
 - Full-text search and filtering by object name, image type, and filter
 - Sortable image table with quality indicators
+- **Image preview** — auto-stretched grayscale thumbnail in the detail panel (FITS and XISF, including LZ4/LZ4+sh-compressed files)
 - Raw header/property storage for arbitrary ad-hoc queries
 - Library statistics (total images, unique objects/filters, total exposure hours)
 - Non-blocking async scanning with a cancellable progress popup
@@ -77,6 +78,7 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `xisf.rs` | XISF XML header parser |
 | `indexer.rs` | Async directory walk, SHA-256 hashing, database writes, throttled progress events, cancel flag |
 | `queries.rs` | Tauri command handlers for search, filter, and stats queries |
+| `preview.rs` | Async image preview: reads raw pixel data, auto-stretch, PNG encode, base64 |
 
 ### Frontend Components
 
@@ -86,7 +88,7 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `Sidebar.tsx` | Directory list, library stats, add/rescan actions |
 | `ImageTable.tsx` | Sortable table of indexed images |
 | `FilterBar.tsx` | Search input and image type / filter dropdowns |
-| `DetailPanel.tsx` | Full metadata view for the selected image |
+| `DetailPanel.tsx` | Full metadata view for the selected image, including auto-stretched preview |
 | `ScanProgress.tsx` | Modal progress popup with cancel button, rendered via React portal |
 
 ## Tauri Commands (IPC API)
@@ -96,8 +98,10 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `index_directory` | `dir: string` | `ScanResult` | async; registers dir and scans it |
 | `rescan_all` | — | `ScanResult` | async; rescans all registered dirs |
 | `cancel_scan` | — | `void` | sets cancel flag; scan stops at next file |
-| `list_images` | `search?, image_type?, filter_name?` | `ImageRow[]` | |
+| `list_images` | `search?, image_type?, filter_name?, object_name?` | `ImageRow[]` | |
 | `get_image_detail` | `id: number` | `ImageDetail` | |
+| `get_image_preview` | `file_path: string` | `string` (data URL) | async; returns base64 PNG |
+| `get_object_options` | — | `string[]` | distinct object names for filter dropdown |
 | `list_directories` | — | `DirectoryEntry[]` | |
 | `remove_directory` | `path: string` | `void` | |
 | `get_library_stats` | — | `LibraryStats` | |
@@ -195,6 +199,10 @@ PixInsight's binary format with a signature (`XISF0100`), a header length field,
 
 XISF properties mapped: `Observation:Object:Name`, `Observation:Time:Start`, `Instrument:ExposureTime`, `Camera:Gain`, `Filter:Name`, `Instrument:Telescope:Name`, `Creator:Application`, and more.
 
+### Image Preview
+
+`preview.rs` implements `get_image_preview`: reads raw pixel data from FITS or XISF, applies a median+MAD auto-stretch with a square-root tone curve, downsamples to max 800×600, and returns a base64-encoded PNG data URL. Handles LZ4 and LZ4+byte-shuffle compressed XISF blocks (the default output of N.I.N.A.).
+
 ## Key Dependencies
 
 ### Rust
@@ -208,6 +216,9 @@ XISF properties mapped: `Observation:Object:Name`, `Observation:Time:Start`, `In
 | `quick-xml` | XISF XML header parsing |
 | `walkdir` | Recursive directory traversal |
 | `sha2` + `hex` | SHA-256 file hashing |
+| `image` (png feature) | PNG encoding for previews |
+| `base64` | Base64 encoding of preview data URLs |
+| `lz4_flex` | LZ4 decompression for compressed XISF files (N.I.N.A. default) |
 | `chrono` | Date/time parsing |
 | `serde` / `serde_json` | Serialization across the IPC boundary |
 | `thiserror` | Ergonomic error types |
