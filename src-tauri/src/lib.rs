@@ -46,6 +46,7 @@ pub fn run() {
             queries::remove_directory,
             queries::get_library_stats,
             queries::get_filter_options,
+            queries::get_object_options,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

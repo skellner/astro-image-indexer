@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { DirectoryEntry } from "../types";
 
 interface Props {
@@ -24,7 +25,8 @@ export function Sidebar({ dirs, onDirsChange }: Props) {
           {dirs.map((d) => (
             <li
               key={d.id}
-              className="group flex items-start justify-between gap-1 rounded px-2 py-1.5 hover:bg-gray-800"
+              className="group flex items-start justify-between gap-1 rounded px-2 py-1.5 hover:bg-gray-800 cursor-pointer"
+              onClick={() => openPath(d.path)}
             >
               <div className="min-w-0">
                 <p className="text-xs text-gray-300 truncate" title={d.path}>
@@ -33,7 +35,7 @@ export function Sidebar({ dirs, onDirsChange }: Props) {
                 <p className="text-xs text-gray-600">{d.image_count} images</p>
               </div>
               <button
-                onClick={() => removeDir(d.path)}
+                onClick={(e) => { e.stopPropagation(); removeDir(d.path); }}
                 className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs shrink-0 transition-opacity"
                 title="Remove directory"
               >

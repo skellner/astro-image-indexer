@@ -83,6 +83,7 @@ pub fn list_images(
     search: Option<String>,
     image_type: Option<String>,
     filter_name: Option<String>,
+    object_name: Option<String>,
     state: State<AppState>,
 ) -> Result<Vec<ImageRow>, String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
@@ -112,6 +113,12 @@ pub fn list_images(
         if !f.is_empty() {
             conditions.push("filter_name = ?".into());
             values.push(Box::new(f.clone()));
+        }
+    }
+    if let Some(ref o) = object_name {
+        if !o.is_empty() {
+            conditions.push("object_name = ?".into());
+            values.push(Box::new(o.clone()));
         }
     }
 
@@ -343,6 +350,24 @@ pub fn get_filter_options(state: State<AppState>) -> Result<Vec<String>, String>
             "SELECT DISTINCT filter_name FROM images
              WHERE filter_name IS NOT NULL
              ORDER BY filter_name",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+#[tauri::command]
+pub fn get_object_options(state: State<AppState>) -> Result<Vec<String>, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT object_name FROM images
+             WHERE object_name IS NOT NULL
+             ORDER BY object_name",
         )
         .map_err(|e| e.to_string())?;
     let rows: Vec<String> = stmt

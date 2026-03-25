@@ -20,25 +20,29 @@ export default function App() {
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [images, setImages] = useState<ImageRow[]>([]);
   const [filterOptions, setFilterOptions] = useState<string[]>([]);
+  const [objectOptions, setObjectOptions] = useState<string[]>([]);
   const [selected, setSelected] = useState<ImageRow | null>(null);
 
   const [search, setSearch] = useState("");
   const [imageType, setImageType] = useState("");
   const [filterName, setFilterName] = useState("");
+  const [objectName, setObjectName] = useState("");
 
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [lastResult, setLastResult] = useState<ScanResult | null>(null);
 
   const refreshDirs = useCallback(async () => {
-    const [d, s, f] = await Promise.all([
+    const [d, s, f, o] = await Promise.all([
       invoke<DirectoryEntry[]>("list_directories"),
       invoke<LibraryStats>("get_library_stats"),
       invoke<string[]>("get_filter_options"),
+      invoke<string[]>("get_object_options"),
     ]);
     setDirs(d);
     setStats(s);
     setFilterOptions(f);
+    setObjectOptions(o);
   }, []);
 
   const refreshImages = useCallback(async () => {
@@ -46,9 +50,10 @@ export default function App() {
       search: search || null,
       imageType: imageType || null,
       filterName: filterName || null,
+      objectName: objectName || null,
     });
     setImages(rows);
-  }, [search, imageType, filterName]);
+  }, [search, imageType, filterName, objectName]);
 
   useEffect(() => { refreshDirs(); }, [refreshDirs]);
   useEffect(() => { refreshImages(); }, [refreshImages]);
@@ -105,10 +110,13 @@ export default function App() {
             search={search}
             imageType={imageType}
             filterName={filterName}
+            objectName={objectName}
             filterOptions={filterOptions}
+            objectOptions={objectOptions}
             onSearchChange={setSearch}
             onImageTypeChange={setImageType}
             onFilterNameChange={setFilterName}
+            onObjectNameChange={setObjectName}
           />
           <div className="flex items-center px-4 py-1.5 border-b border-gray-800">
             <span className="text-xs text-gray-500">
