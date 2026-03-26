@@ -10,6 +10,56 @@ mod xisf;
 use std::sync::{atomic::AtomicBool, Arc, Mutex};
 use tauri::Manager;
 
+/// Open a file with its associated application (equivalent to double-clicking in Explorer).
+#[tauri::command]
+fn open_file(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // `cmd /c start "" "<path>"` launches the file with its default handler.
+        // The empty string is a required title argument when the path may contain spaces.
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+/// Open File Explorer with the given file selected/highlighted.
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .and_then(|p| p.to_str())
+            .unwrap_or(&path)
+            .to_string();
+        std::process::Command::new("xdg-open")
+            .arg(&parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
 pub struct AppState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
     pub cancel_flag: Arc<AtomicBool>,
@@ -50,6 +100,8 @@ pub fn run() {
             queries::get_filter_options,
             queries::get_object_options,
             preview::get_image_preview,
+            open_file,
+            reveal_in_folder,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

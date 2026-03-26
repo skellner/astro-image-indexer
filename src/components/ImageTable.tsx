@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { ImageRow } from "../types";
 
 interface Props {
@@ -74,6 +75,7 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
             <tr
               key={img.id}
               onClick={() => onSelect(img)}
+              onDoubleClick={() => invoke("open_file", { path: img.file_path })}
               className={`border-t border-gray-800 cursor-pointer transition-colors ${
                 img.id === selectedId
                   ? "bg-blue-900/40"
