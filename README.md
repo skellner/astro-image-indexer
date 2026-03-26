@@ -107,6 +107,7 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `list_images` | `search?, image_type?, filter_name?, object_name?` | `ImageRow[]` | |
 | `get_image_detail` | `id: number` | `ImageDetail` | |
 | `get_image_preview` | `file_path: string` | `string` (data URL) | async; returns base64 PNG |
+| `open_file` | `path: string` | `void` | opens file with its default Windows application |
 | `get_object_options` | — | `string[]` | distinct object names for filter dropdown |
 | `list_directories` | — | `DirectoryEntry[]` | |
 | `remove_directory` | `path: string` | `void` | |
@@ -121,26 +122,44 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 
 ## Scanning Design
 
+### Three-phase parallel architecture
+
+Scanning uses a three-phase pipeline for maximum throughput:
+
+| Phase | Work | Threading |
+|---|---|---|
+| 1. **Classify** | `stat()` each file + HashMap lookup against pre-fetched DB records | Serial (fast — just syscalls) |
+| 2. **Process** | SHA-256 hashing, metadata parsing, FWHM/star analysis | **Parallel** via `rayon` (all CPU cores) |
+| 3. **Write DB** | Upsert images + raw headers | Serial, single `BEGIN`/`COMMIT` transaction |
+
+### Fast skip (mtime + size)
+
+Before computing a SHA-256 hash (which reads the entire file), the scanner checks if the file's size and modification time match the existing DB record. If both match, the file is assumed unchanged and skipped with zero disk IO. This makes rescan of an unchanged library nearly instant.
+
 ### Async execution
 
 `index_directory` and `rescan_all` are `async` Tauri commands. The actual file work runs inside `tauri::async_runtime::spawn_blocking`, which moves it off the async runtime onto a dedicated blocking thread. This keeps the Tauri IPC loop free to process other commands — including `cancel_scan` — while a scan is in progress.
 
 ### Cancellation
 
-`AppState` holds an `Arc<AtomicBool>` cancel flag shared between the command handlers and `scan_dir`.
+`AppState` holds an `Arc<AtomicBool>` cancel flag shared between the command handlers and the rayon worker threads.
 
 1. Any new scan resets the flag to `false` before starting.
 2. `cancel_scan` sets it to `true` from the frontend at any time.
-3. `scan_dir` checks the flag at the top of its per-file loop and breaks early if set.
+3. Each rayon worker checks the flag before processing a file and returns early if set.
 4. The frontend dismisses the popup immediately on cancel without waiting for the scan to return.
+
+### Panic safety
+
+The parallel processing phase is wrapped in `std::panic::catch_unwind` so that a panic in any rayon worker thread does not poison the `Mutex<Connection>`. Without this, a single bad file could make all subsequent DB operations fail until the app is restarted. Transaction failures trigger an explicit `ROLLBACK` to keep the connection clean.
 
 ### Progress throttling
 
-`scan_dir` tracks the last emit time with `std::time::Instant` and skips the `app.emit()` call unless at least 100 ms have elapsed. This prevents flooding WebView2's message queue on large libraries.
+Worker threads share an `AtomicUsize` counter and a `Mutex<Instant>` for last-emit tracking. Progress events are emitted at most once per 100 ms to prevent flooding WebView2's message queue. The frontend shows elapsed time and an estimated ETA based on the processing rate.
 
 ### Progress popup
 
-`ScanProgress.tsx` is rendered via `ReactDOM.createPortal` into `document.body`, outside the app's root `<div>`. This avoids being clipped by the root container's `overflow: hidden`. All styles are inline to guarantee correct rendering regardless of Tailwind's stylesheet scope.
+`ScanProgress.tsx` is rendered via `ReactDOM.createPortal` into `document.body`, outside the app's root `<div>`. This avoids being clipped by the root container's `overflow: hidden`. All styles are inline to guarantee correct rendering regardless of Tailwind's stylesheet scope. The popup displays elapsed time, ETA, and total scan duration on the completion screen.
 
 ## Database Schema
 
@@ -237,6 +256,7 @@ Pixel-read errors are silently swallowed so metadata is always indexed even if t
 | `image` (png feature) | PNG encoding for previews |
 | `base64` | Base64 encoding of preview data URLs |
 | `lz4_flex` | LZ4 decompression for compressed XISF files (N.I.N.A. default) |
+| `rayon` | Parallel file processing (hashing, parsing, quality analysis) |
 | `chrono` | Date/time parsing |
 | `serde` / `serde_json` | Serialization across the IPC boundary |
 | `thiserror` | Ergonomic error types |
