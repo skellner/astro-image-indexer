@@ -9,7 +9,7 @@ interface Props {
 
 type SortKey = keyof Pick<
   ImageRow,
-  "file_name" | "object_name" | "image_type" | "filter_name" | "exposure_time" | "date_obs" | "instrument"
+  "file_name" | "object_name" | "image_type" | "filter_name" | "exposure_time" | "date_obs" | "instrument" | "fwhm" | "star_count"
 >;
 
 export function ImageTable({ images, onSelect, selectedId }: Props) {
@@ -24,7 +24,18 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
   const sorted = [...images].sort((a, b) => {
     const av = a[sortKey] ?? "";
     const bv = b[sortKey] ?? "";
-    const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
+    const numA = typeof av === "number" ? av : null;
+    const numB = typeof bv === "number" ? bv : null;
+    let cmp: number;
+    if (numA !== null && numB !== null) {
+      cmp = numA - numB;
+    } else if (numA !== null) {
+      cmp = 1; // nulls last
+    } else if (numB !== null) {
+      cmp = -1;
+    } else {
+      cmp = String(av).localeCompare(String(bv), undefined, { numeric: true });
+    }
     return sortAsc ? cmp : -cmp;
   });
 
@@ -54,6 +65,8 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
             <th className="px-3 py-2 text-xs font-medium text-gray-500 uppercase tracking-wider">
               Temp
             </th>
+            <Th label="FWHM" sortKey="fwhm" current={sortKey} asc={sortAsc} onSort={toggleSort} />
+            <Th label="Stars" sortKey="star_count" current={sortKey} asc={sortAsc} onSort={toggleSort} />
           </tr>
         </thead>
         <tbody>
@@ -93,6 +106,12 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
               </td>
               <td className="px-3 py-2 text-gray-500 text-xs whitespace-nowrap">
                 {img.ccd_temp != null ? `${img.ccd_temp.toFixed(1)}°C` : "—"}
+              </td>
+              <td className="px-3 py-2 text-gray-300 text-xs whitespace-nowrap">
+                {img.fwhm != null ? `${img.fwhm.toFixed(2)}"` : "—"}
+              </td>
+              <td className="px-3 py-2 text-gray-300 text-xs whitespace-nowrap text-right">
+                {img.star_count != null ? img.star_count.toLocaleString() : "—"}
               </td>
             </tr>
           ))}

@@ -8,9 +8,11 @@ A Tauri 2 desktop application for Windows that scans local directories, parses m
 - Metadata extraction from 40+ fields (target, exposure, gain, filter, telescope, RA/Dec, temperature, etc.)
 - SHA-256 deduplication — unchanged files are skipped on rescan
 - Full-text search and filtering by object name, image type, and filter
-- Sortable image table with quality indicators
+- Sortable image table with FWHM and star-count columns for light frames
+- **Calendar view** — monthly grid showing which objects were imaged each day, with month navigation
 - **Image preview** — auto-stretched grayscale thumbnail in the detail panel (FITS and XISF, including LZ4/LZ4+sh-compressed files)
-- **Automatic quality analysis** — FWHM and star count computed for every light frame during scanning; stored in the database and shown in the detail panel
+- **Automatic quality analysis** — FWHM and star count computed for every light frame during scanning; stored in the database and shown in the table and detail panel
+- Click a directory in the sidebar to open it in Windows Explorer
 - Raw header/property storage for arbitrary ad-hoc queries
 - Library statistics (total images, unique objects/filters, total exposure hours)
 - Non-blocking async scanning with a cancellable progress popup
@@ -86,10 +88,12 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 
 | Component | Responsibility |
 |---|---|
-| `App.tsx` | Root state management (directories, images, filters, scan progress) |
-| `Sidebar.tsx` | Directory list, library stats, add/rescan actions |
-| `ImageTable.tsx` | Sortable table of indexed images |
-| `FilterBar.tsx` | Search input and image type / filter dropdowns |
+| `App.tsx` | Root state management (directories, images, filters, scan progress, active view) |
+| `TopBar.tsx` | Library stats, Add Directory and Rescan All buttons |
+| `Sidebar.tsx` | Directory list; clicking a directory opens it in Windows Explorer |
+| `FilterBar.tsx` | Search input and image type / filter / object dropdowns |
+| `ImageTable.tsx` | Sortable table of indexed images including FWHM and star-count columns |
+| `CalendarView.tsx` | Monthly calendar grid; each day shows object names for frames taken that night |
 | `DetailPanel.tsx` | Full metadata view for the selected image, including auto-stretched preview |
 | `ScanProgress.tsx` | Modal progress popup with cancel button, rendered via React portal |
 

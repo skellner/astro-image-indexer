@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { CalendarView } from "./components/CalendarView";
 import { DetailPanel } from "./components/DetailPanel";
 import { FilterBar } from "./components/FilterBar";
 import { ImageTable } from "./components/ImageTable";
@@ -27,6 +28,8 @@ export default function App() {
   const [imageType, setImageType] = useState("");
   const [filterName, setFilterName] = useState("");
   const [objectName, setObjectName] = useState("");
+
+  const [activeView, setActiveView] = useState<"table" | "calendar">("table");
 
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
@@ -106,33 +109,58 @@ export default function App() {
       <div className="flex flex-1 min-h-0">
         <Sidebar dirs={dirs} onDirsChange={refreshDirs} />
         <div className="flex flex-col flex-1 min-w-0">
-          <FilterBar
-            search={search}
-            imageType={imageType}
-            filterName={filterName}
-            objectName={objectName}
-            filterOptions={filterOptions}
-            objectOptions={objectOptions}
-            onSearchChange={setSearch}
-            onImageTypeChange={setImageType}
-            onFilterNameChange={setFilterName}
-            onObjectNameChange={setObjectName}
-          />
-          <div className="flex items-center px-4 py-1.5 border-b border-gray-800">
-            <span className="text-xs text-gray-500">
-              {images.length} image{images.length !== 1 ? "s" : ""}
-            </span>
+          {/* Tab bar */}
+          <div className="flex items-center border-b border-gray-800 px-4 gap-1 pt-1">
+            {(["table", "calendar"] as const).map((view) => (
+              <button
+                key={view}
+                onClick={() => setActiveView(view)}
+                className={`px-4 py-1.5 text-sm font-medium rounded-t transition-colors capitalize ${
+                  activeView === view
+                    ? "bg-gray-800 text-gray-100 border border-b-0 border-gray-700"
+                    : "text-gray-500 hover:text-gray-300"
+                }`}
+              >
+                {view === "table" ? "Table" : "Calendar"}
+              </button>
+            ))}
           </div>
-          <div className="flex flex-1 min-h-0">
-            <ImageTable
-              images={images}
-              onSelect={setSelected}
-              selectedId={selected?.id ?? null}
-            />
-            {selected && (
-              <DetailPanel image={selected} onClose={() => setSelected(null)} />
-            )}
-          </div>
+
+          {activeView === "table" && (
+            <>
+              <FilterBar
+                search={search}
+                imageType={imageType}
+                filterName={filterName}
+                objectName={objectName}
+                filterOptions={filterOptions}
+                objectOptions={objectOptions}
+                onSearchChange={setSearch}
+                onImageTypeChange={setImageType}
+                onFilterNameChange={setFilterName}
+                onObjectNameChange={setObjectName}
+              />
+              <div className="flex items-center px-4 py-1.5 border-b border-gray-800">
+                <span className="text-xs text-gray-500">
+                  {images.length} image{images.length !== 1 ? "s" : ""}
+                </span>
+              </div>
+              <div className="flex flex-1 min-h-0">
+                <ImageTable
+                  images={images}
+                  onSelect={setSelected}
+                  selectedId={selected?.id ?? null}
+                />
+                {selected && (
+                  <DetailPanel image={selected} onClose={() => setSelected(null)} />
+                )}
+              </div>
+            </>
+          )}
+
+          {activeView === "calendar" && (
+            <CalendarView images={images} />
+          )}
         </div>
       </div>
     </div>
