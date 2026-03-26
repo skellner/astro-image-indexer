@@ -1,7 +1,11 @@
+use std::path::Path;
+
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use crate::preview;
+use crate::quality;
 use crate::AppState;
 
 // ---------------------------------------------------------------------------
@@ -376,4 +380,59 @@ pub fn get_object_options(state: State<AppState>) -> Result<Vec<String>, String>
         .filter_map(|r| r.ok())
         .collect();
     Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// On-demand quality analysis
+// ---------------------------------------------------------------------------
+
+/// Result of on-demand quality computation.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QualityResult {
+    pub fwhm: Option<f64>,
+    pub star_count: Option<i64>,
+}
+
+/// Compute FWHM and star count for a single image on demand.
+/// Pixel I/O runs on a blocking thread so the Mutex is only held for the final DB write.
+#[tauri::command]
+pub async fn compute_quality(
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<QualityResult, String> {
+    let conn = state.conn.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = Path::new(&file_path);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let pixel_result = match ext.as_str() {
+            "fits" | "fit" => preview::load_fits_pixels(path),
+            _ => preview::load_xisf_pixels(path),
+        };
+
+        let (fwhm, star_count) = match pixel_result {
+            Ok(buf) => match quality::analyse_stars(&buf) {
+                Some((f, c)) => (Some(f), Some(c as i64)),
+                None => (None, None),
+            },
+            Err(_) => (None, None),
+        };
+
+        // Write results to DB (short lock, just a single UPDATE).
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
+            params![fwhm, star_count, file_path],
+        )
+        .map_err(|e| e.to_string())?;
+
+        Ok(QualityResult { fwhm, star_count })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -8,14 +7,11 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, State};
 use walkdir::WalkDir;
 
 use crate::fits;
 use crate::metadata::ImageMetadata;
-use crate::preview;
-use crate::quality;
 use crate::xisf;
 use crate::AppState;
 
@@ -45,9 +41,6 @@ pub struct ScanResult {
 struct ExistingRecord {
     file_size: i64,
     file_modified_at: Option<String>,
-    file_hash: String,
-    image_type: Option<String>,
-    fwhm: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -63,20 +56,26 @@ pub async fn index_directory(
 ) -> Result<ScanResult, String> {
     let cancel = state.cancel_flag.clone();
     let conn = state.conn.clone();
+    let is_scanning = state.is_scanning.clone();
     cancel.store(false, Ordering::Relaxed);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let path = PathBuf::from(&dir);
-        if !path.is_dir() {
-            return Err(format!("Not a directory: {dir}"));
-        }
-        let conn = conn.lock().map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT OR IGNORE INTO scan_directories (path, added_at) VALUES (?1, ?2)",
-            params![dir, Utc::now().to_rfc3339()],
-        )
-        .map_err(|e| e.to_string())?;
-        scan_dir(&dir, &app, &conn, &cancel)
+        is_scanning.store(true, Ordering::Relaxed);
+        let result = (|| {
+            let path = PathBuf::from(&dir);
+            if !path.is_dir() {
+                return Err(format!("Not a directory: {dir}"));
+            }
+            let conn = conn.lock().map_err(|e| e.to_string())?;
+            conn.execute(
+                "INSERT OR IGNORE INTO scan_directories (path, added_at) VALUES (?1, ?2)",
+                params![dir, Utc::now().to_rfc3339()],
+            )
+            .map_err(|e| e.to_string())?;
+            scan_dir(&dir, &app, &conn, &cancel)
+        })();
+        is_scanning.store(false, Ordering::Relaxed);
+        result
     })
     .await
     .map_err(|e| e.to_string())?
@@ -93,49 +92,55 @@ pub fn cancel_scan(state: State<AppState>) {
 pub async fn rescan_all(app: AppHandle, state: State<'_, AppState>) -> Result<ScanResult, String> {
     let cancel = state.cancel_flag.clone();
     let conn = state.conn.clone();
+    let is_scanning = state.is_scanning.clone();
     cancel.store(false, Ordering::Relaxed);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let conn = conn.lock().map_err(|e| e.to_string())?;
+        is_scanning.store(true, Ordering::Relaxed);
+        let result = (|| {
+            let conn = conn.lock().map_err(|e| e.to_string())?;
 
-        let dirs: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT path FROM scan_directories")
-                .map_err(|e| e.to_string())?;
-            let rows: Vec<String> = stmt
-                .query_map([], |r| r.get(0))
-                .map_err(|e| e.to_string())?
-                .filter_map(|r| r.ok())
-                .collect();
-            rows
-        };
+            let dirs: Vec<String> = {
+                let mut stmt = conn
+                    .prepare("SELECT path FROM scan_directories")
+                    .map_err(|e| e.to_string())?;
+                let rows: Vec<String> = stmt
+                    .query_map([], |r| r.get(0))
+                    .map_err(|e| e.to_string())?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                rows
+            };
 
-        let mut combined = ScanResult {
-            indexed: 0,
-            skipped: 0,
-            errors: 0,
-            error_details: Vec::new(),
-        };
+            let mut combined = ScanResult {
+                indexed: 0,
+                skipped: 0,
+                errors: 0,
+                error_details: Vec::new(),
+            };
 
-        for dir in dirs {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            match scan_dir(&dir, &app, &conn, &cancel) {
-                Ok(r) => {
-                    combined.indexed += r.indexed;
-                    combined.skipped += r.skipped;
-                    combined.errors += r.errors;
-                    combined.error_details.extend(r.error_details);
+            for dir in dirs {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
                 }
-                Err(e) => {
-                    combined.errors += 1;
-                    combined.error_details.push(e);
+                match scan_dir(&dir, &app, &conn, &cancel) {
+                    Ok(r) => {
+                        combined.indexed += r.indexed;
+                        combined.skipped += r.skipped;
+                        combined.errors += r.errors;
+                        combined.error_details.extend(r.error_details);
+                    }
+                    Err(e) => {
+                        combined.errors += 1;
+                        combined.error_details.push(e);
+                    }
                 }
             }
-        }
 
-        Ok(combined)
+            Ok(combined)
+        })();
+        is_scanning.store(false, Ordering::Relaxed);
+        result
     })
     .await
     .map_err(|e| e.to_string())?
@@ -252,82 +257,22 @@ fn process_file(
             ex.file_size == file_size && ex.file_modified_at.as_deref() == file_modified.as_deref();
 
         if stat_match {
-            // File unchanged. Skip unless it's a light frame missing quality data.
-            let needs_quality =
-                ex.image_type.as_deref() == Some("Light") && ex.fwhm.is_none();
-            if !needs_quality {
-                return Ok(false);
-            }
-
-            // Compute quality only.
-            let ext = extension_lower(path);
-            let pixel_result = match ext.as_str() {
-                "fits" | "fit" => preview::load_fits_pixels(path),
-                _ => preview::load_xisf_pixels(path),
-            };
-            if let Ok(buf) = pixel_result {
-                if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
-                    conn.execute(
-                        "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
-                        params![fwhm, count, fp.as_ref()],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-            }
-            return Ok(true);
-        }
-
-        // Stat changed — hash to check if content really changed.
-        let hash = sha256_file(path).map_err(|e| e.to_string())?;
-        if hash == ex.file_hash {
-            // Content identical; just refresh stat columns.
-            conn.execute(
-                "UPDATE images SET file_size = ?1, file_modified_at = ?2 WHERE file_path = ?3",
-                params![file_size, file_modified, fp.as_ref()],
-            )
-            .map_err(|e| e.to_string())?;
             return Ok(false);
         }
 
-        // Content changed — fall through to full index.
-        return full_index(path, conn, file_size, file_modified, hash);
+        // Stat changed → re-parse metadata (header only, a few KB).
     }
 
-    // New file — hash + full parse.
-    let hash = sha256_file(path).map_err(|e| e.to_string())?;
-    full_index(path, conn, file_size, file_modified, hash)
-}
-
-fn full_index(
-    path: &Path,
-    conn: &Connection,
-    file_size: i64,
-    file_modified: Option<String>,
-    hash: String,
-) -> Result<bool, String> {
+    // New or changed file — parse header and index.
     let ext = extension_lower(path);
 
-    let (mut meta, raw) = match ext.as_str() {
+    let (meta, raw) = match ext.as_str() {
         "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
         "xisf" => xisf::parse(path).map_err(|e| e.to_string())?,
         _ => return Err(format!("Unsupported extension: {ext}")),
     };
 
-    // For light frames, compute FWHM + star count (errors silently ignored).
-    if meta.image_type.as_deref() == Some("Light") {
-        let pixel_result = match ext.as_str() {
-            "fits" | "fit" => preview::load_fits_pixels(path),
-            _ => preview::load_xisf_pixels(path),
-        };
-        if let Ok(buf) = pixel_result {
-            if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
-                meta.fwhm = Some(fwhm);
-                meta.star_count = Some(count);
-            }
-        }
-    }
-
-    upsert_and_headers(path, conn, file_size, file_modified, hash, &meta, &raw)?;
+    upsert_and_headers(path, conn, file_size, file_modified, &meta, &raw)?;
     Ok(true)
 }
 
@@ -338,8 +283,7 @@ fn full_index(
 fn prefetch_existing(conn: &Connection) -> Result<HashMap<String, ExistingRecord>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT file_path, file_size, file_modified_at, file_hash, image_type, fwhm \
-             FROM images",
+            "SELECT file_path, file_size, file_modified_at FROM images",
         )
         .map_err(|e| e.to_string())?;
 
@@ -351,9 +295,6 @@ fn prefetch_existing(conn: &Connection) -> Result<HashMap<String, ExistingRecord
                 ExistingRecord {
                     file_size: r.get(1)?,
                     file_modified_at: r.get(2)?,
-                    file_hash: r.get(3)?,
-                    image_type: r.get(4)?,
-                    fwhm: r.get(5)?,
                 },
             ))
         })
@@ -422,7 +363,6 @@ fn upsert_and_headers(
     conn: &Connection,
     file_size: i64,
     file_modified: Option<String>,
-    hash: String,
     meta: &ImageMetadata,
     raw: &HashMap<String, String>,
 ) -> Result<(), String> {
@@ -433,6 +373,7 @@ fn upsert_and_headers(
         .to_string_lossy()
         .to_string();
     let now = Utc::now().to_rfc3339();
+    let hash = ""; // No longer computed — mtime+size used for change detection.
 
     conn.execute(
         "INSERT INTO images (
@@ -529,21 +470,3 @@ fn upsert_and_headers(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Hashing
-// ---------------------------------------------------------------------------
-
-fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}

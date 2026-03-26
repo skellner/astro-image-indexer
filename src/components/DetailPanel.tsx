@@ -5,21 +5,46 @@ import { ImageDetail, ImageRow } from "../types";
 interface Props {
   image: ImageRow;
   onClose: () => void;
+  onQualityComputed?: (id: number, fwhm: number | null, starCount: number | null) => void;
 }
 
-export function DetailPanel({ image, onClose }: Props) {
+export function DetailPanel({ image, onClose, onQualityComputed }: Props) {
   const [detail, setDetail] = useState<ImageDetail | null>(null);
   const [showRaw, setShowRaw] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  const [qualityFwhm, setQualityFwhm] = useState<number | null>(null);
+  const [qualityStars, setQualityStars] = useState<number | null>(null);
+  const [qualityLoading, setQualityLoading] = useState(false);
 
   useEffect(() => {
     setDetail(null);
+    setQualityFwhm(null);
+    setQualityStars(null);
     invoke<{ row: ImageRow } & Omit<ImageDetail, keyof ImageRow>>("get_image_detail", { id: image.id })
       .then((d) => setDetail(d as unknown as ImageDetail))
       .catch(console.error);
   }, [image.id]);
+
+  // On-demand quality analysis for light frames without FWHM data.
+  useEffect(() => {
+    if (image.image_type !== "Light") return;
+    if (image.fwhm != null) {
+      setQualityFwhm(image.fwhm);
+      setQualityStars(image.star_count ?? null);
+      return;
+    }
+    setQualityLoading(true);
+    invoke<{ fwhm: number | null; star_count: number | null }>("compute_quality", { filePath: image.file_path })
+      .then((r) => {
+        setQualityFwhm(r.fwhm);
+        setQualityStars(r.star_count);
+        setQualityLoading(false);
+        onQualityComputed?.(image.id, r.fwhm, r.star_count);
+      })
+      .catch(() => setQualityLoading(false));
+  }, [image.id, image.fwhm, image.star_count, image.image_type, image.file_path]);
 
   useEffect(() => {
     setPreviewUrl(null);
@@ -102,13 +127,19 @@ export function DetailPanel({ image, onClose }: Props) {
           <Row label="Type" value={image.image_type} />
         </Section>
 
-        {(image.fwhm || image.eccentricity || image.star_count || image.snr) && (
+        {(image.image_type === "Light" || image.fwhm || image.eccentricity || image.star_count || image.snr) && (
           <Section title="Quality">
-            <Row label="FWHM" value={image.fwhm != null ? `${image.fwhm.toFixed(2)}"` : null} />
-            <Row label="Eccentricity" value={image.eccentricity?.toFixed(3)} />
-            <Row label="Stars" value={image.star_count?.toLocaleString()} />
-            <Row label="SNR" value={image.snr?.toFixed(1)} />
-            <Row label="Sky bg" value={detail?.sky_background?.toFixed(2)} />
+            {qualityLoading ? (
+              <p className="text-xs text-gray-500 italic">Analysing…</p>
+            ) : (
+              <>
+                <Row label="FWHM" value={(qualityFwhm ?? image.fwhm) != null ? `${(qualityFwhm ?? image.fwhm)!.toFixed(2)}"` : null} />
+                <Row label="Eccentricity" value={image.eccentricity?.toFixed(3)} />
+                <Row label="Stars" value={(qualityStars ?? image.star_count)?.toLocaleString()} />
+                <Row label="SNR" value={image.snr?.toFixed(1)} />
+                <Row label="Sky bg" value={detail?.sky_background?.toFixed(2)} />
+              </>
+            )}
             {image.quality_rejected && (
               <p className="text-xs text-red-400 mt-1">Marked as rejected</p>
             )}

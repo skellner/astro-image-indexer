@@ -63,6 +63,8 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
 pub struct AppState {
     pub conn: Arc<Mutex<rusqlite::Connection>>,
     pub cancel_flag: Arc<AtomicBool>,
+    /// True while a scan is in progress — background quality worker pauses.
+    pub is_scanning: Arc<AtomicBool>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -81,10 +83,18 @@ pub fn run() {
             let db_path = data_dir.join("index.db");
             let conn = db::open(&db_path).expect("failed to open database");
 
+            let conn = Arc::new(Mutex::new(conn));
+            let is_scanning = Arc::new(AtomicBool::new(false));
+
             app.manage(AppState {
-                conn: Arc::new(Mutex::new(conn)),
+                conn: conn.clone(),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
+                is_scanning: is_scanning.clone(),
             });
+
+            // Spawn background quality worker.
+            let handle = app.handle().clone();
+            quality::spawn_backfill_worker(conn, is_scanning, handle);
 
             Ok(())
         })
@@ -99,6 +109,7 @@ pub fn run() {
             queries::get_library_stats,
             queries::get_filter_options,
             queries::get_object_options,
+            queries::compute_quality,
             preview::get_image_preview,
             open_file,
             reveal_in_folder,

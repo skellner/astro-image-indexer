@@ -6,17 +6,19 @@ A Tauri 2 desktop application for Windows that scans local directories, parses m
 
 - Recursive directory scanning for `.fits`, `.fit`, and `.xisf` files
 - Metadata extraction from 40+ fields (target, exposure, gain, filter, telescope, RA/Dec, temperature, etc.)
-- SHA-256 deduplication — unchanged files are skipped on rescan
+- Fast change detection via mtime + file size — unchanged files are skipped on rescan
 - Full-text search and filtering by object name, image type, and filter
 - Sortable image table with FWHM and star-count columns for light frames
 - **Calendar view** — monthly grid showing which objects were imaged each day, with month navigation
 - **Image preview** — auto-stretched grayscale thumbnail in the detail panel (FITS and XISF, including LZ4/LZ4+sh-compressed files)
-- **Automatic quality analysis** — FWHM and star count computed for every light frame during scanning; stored in the database and shown in the table and detail panel
+- **Background quality analysis** — FWHM and star count computed automatically for light frames after scanning; results stream into the table in real time
+- **On-demand quality** — clicking a light frame in the detail panel triggers immediate quality analysis if not yet computed
 - Click a directory in the sidebar to open it in Windows Explorer
+- Double-click a table row to open the file with its default application
 - Raw header/property storage for arbitrary ad-hoc queries
 - Library statistics (total images, unique objects/filters, total exposure hours)
 - Non-blocking async scanning with a cancellable progress popup
-- Real-time scan progress events (throttled to 100 ms)
+- Real-time scan progress events (throttled to 100 ms) with elapsed time and ETA
 
 ## Requirements
 
@@ -74,28 +76,28 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 
 | File | Responsibility |
 |---|---|
-| `lib.rs` | Registers all Tauri commands and plugins; app entry point |
+| `lib.rs` | Registers all Tauri commands and plugins; spawns background quality worker; app entry point |
 | `db.rs` | SQLite initialization, schema migrations, WAL mode |
 | `metadata.rs` | `ImageMetadata` struct shared across parsers |
 | `fits.rs` | FITS binary header parser |
 | `xisf.rs` | XISF XML header parser |
-| `indexer.rs` | Async directory walk, SHA-256 hashing, database writes, throttled progress events, cancel flag |
-| `queries.rs` | Tauri command handlers for search, filter, and stats queries |
+| `indexer.rs` | Async directory walk, mtime+size change detection, database writes, throttled progress events, cancel flag |
+| `queries.rs` | Tauri command handlers for search, filter, stats, and on-demand quality computation |
 | `preview.rs` | Pixel reading (`load_fits_pixels`, `load_xisf_pixels`) + async preview command (stretch, PNG encode, base64) |
-| `quality.rs` | Star detection and FWHM measurement on a center 2048×2048 crop |
+| `quality.rs` | Star detection, FWHM measurement on a center 2048×2048 crop, and background backfill worker |
 
 ### Frontend Components
 
 | Component | Responsibility |
 |---|---|
-| `App.tsx` | Root state management (directories, images, filters, scan progress, active view) |
+| `App.tsx` | Root state management (directories, images, filters, scan progress, active view); listens for background quality events |
 | `TopBar.tsx` | Library stats, Add Directory and Rescan All buttons |
 | `Sidebar.tsx` | Directory list; clicking a directory opens it in Windows Explorer |
 | `FilterBar.tsx` | Search input and image type / filter / object dropdowns |
-| `ImageTable.tsx` | Sortable table of indexed images including FWHM and star-count columns |
-| `CalendarView.tsx` | Monthly calendar grid; each day shows object names for frames taken that night |
-| `DetailPanel.tsx` | Full metadata view for the selected image, including auto-stretched preview |
-| `ScanProgress.tsx` | Modal progress popup with cancel button, rendered via React portal |
+| `ImageTable.tsx` | Sortable table of indexed images including FWHM and star-count columns; double-click opens file |
+| `CalendarView.tsx` | Monthly calendar grid; each day shows object names and total exposure for frames taken that night |
+| `DetailPanel.tsx` | Full metadata view for the selected image, including auto-stretched preview and on-demand quality analysis |
+| `ScanProgress.tsx` | Modal progress popup with cancel button, elapsed time, ETA; rendered via React portal |
 
 ## Tauri Commands (IPC API)
 
@@ -107,6 +109,7 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `list_images` | `search?, image_type?, filter_name?, object_name?` | `ImageRow[]` | |
 | `get_image_detail` | `id: number` | `ImageDetail` | |
 | `get_image_preview` | `file_path: string` | `string` (data URL) | async; returns base64 PNG |
+| `compute_quality` | `file_path: string` | `QualityResult` | async; computes FWHM + star count on demand |
 | `open_file` | `path: string` | `void` | opens file with its default Windows application |
 | `get_object_options` | — | `string[]` | distinct object names for filter dropdown |
 | `list_directories` | — | `DirectoryEntry[]` | |
@@ -118,13 +121,18 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 
 | Event | Payload | Notes |
 |---|---|---|
-| `indexer://progress` | `{ current: number, total: number, file_name: string }` | throttled to max once per 100 ms |
+| `indexer://progress` | `{ current, total, file_name }` | throttled to max once per 100 ms |
+| `quality://update` | `{ file_path, fwhm, star_count }` | emitted by background worker when a file's quality is computed |
 
 ## Scanning Design
 
+### Header-only parsing
+
+Scanning only reads file headers (a few KB per file) to extract metadata — it never reads the full pixel data. This makes initial scans extremely fast even for large libraries with multi-megabyte image files.
+
 ### Fast skip (mtime + size)
 
-Before computing a SHA-256 hash (which reads the entire file), the scanner checks if the file's size and modification time match a pre-fetched in-memory cache of all existing DB records. If both match, the file is assumed unchanged and skipped with zero disk IO. This makes rescan of an unchanged library nearly instant — a single `stat()` + HashMap lookup per file, no file reads at all.
+Before parsing, the scanner checks if the file's size and modification time match a pre-fetched in-memory cache of all existing DB records. If both match, the file is assumed unchanged and skipped with zero disk IO. This makes rescan of an unchanged library nearly instant — a single `stat()` + HashMap lookup per file.
 
 ### Batched transactions
 
@@ -151,6 +159,23 @@ All DB writes within a scan are wrapped in a single `BEGIN`/`COMMIT` transaction
 
 `ScanProgress.tsx` is rendered via `ReactDOM.createPortal` into `document.body`, outside the app's root `<div>`. This avoids being clipped by the root container's `overflow: hidden`. All styles are inline to guarantee correct rendering regardless of Tailwind's stylesheet scope. The popup displays elapsed time, ETA, and total scan duration on the completion screen.
 
+## Background Quality Analysis
+
+Quality analysis (FWHM and star count) is decoupled from scanning to keep scans fast and the UI responsive:
+
+1. **Background worker** — A dedicated thread starts on app launch and continuously processes light frames with missing quality data. It pauses automatically while a scan is in progress.
+2. **On-demand** — When a user clicks on a light frame in the detail panel, `compute_quality` is called immediately if FWHM is not yet available, providing instant feedback.
+3. **Real-time updates** — The background worker emits `quality://update` events as each file is processed; the frontend patches the table in-place so FWHM and star-count columns populate progressively.
+4. **No full-file reads during scan** — Pixel data (50–100 MB per file) is only loaded by the background worker or on-demand command, never during the scan itself.
+
+The analysis pipeline:
+
+1. **Crop** — extracts the center 2048×2048 region to limit cost on large sensors
+2. **Background** — estimates sky level (median) and noise (MAD × 1.4826)
+3. **Detection** — finds local maxima above a 10σ threshold using a 5×5 neighborhood window
+4. **FWHM** — for each candidate, walks outward in four axis-aligned directions to the half-maximum level; uses linear interpolation for sub-pixel accuracy; rejects stars with FWHM outside [1.5, 25] px
+5. **Output** — median FWHM in pixels and star count, written to `images.fwhm` / `images.star_count`
+
 ## Database Schema
 
 The SQLite database is stored at `%APPDATA%\tauri-app\index.db`.
@@ -168,7 +193,7 @@ The SQLite database is stored at `%APPDATA%\tauri-app\index.db`.
 
 | Column Group | Fields |
 |---|---|
-| File | `file_path` (unique), `file_name`, `file_size`, `file_modified_at`, `file_hash` (SHA-256), `format` |
+| File | `file_path` (unique), `file_name`, `file_size`, `file_modified_at`, `file_hash`, `format` |
 | Target | `object_name`, `ra`, `dec` (J2000 decimal degrees) |
 | Capture | `date_obs`, `exposure_time`, `gain`, `offset`, `iso`, `filter_name`, `binning_x`, `binning_y` |
 | Equipment | `telescope`, `instrument`, `focal_length`, `aperture` |
@@ -218,18 +243,6 @@ XISF properties mapped: `Observation:Object:Name`, `Observation:Time:Start`, `In
 
 `preview.rs` implements `get_image_preview`: reads raw pixel data from FITS or XISF, applies a median+MAD auto-stretch with a square-root tone curve, downsamples to max 800×600, and returns a base64-encoded PNG data URL. Handles LZ4 and LZ4+byte-shuffle compressed XISF blocks (the default output of N.I.N.A.).
 
-### Quality Analysis (FWHM and Star Count)
-
-`quality.rs` runs automatically for every light frame during scanning:
-
-1. **Crop** — extracts the center 2048×2048 region to limit analysis cost on large sensors
-2. **Background** — estimates sky level (median) and noise (MAD × 1.4826)
-3. **Detection** — finds local maxima above a 10σ threshold using a 5×5 neighborhood window
-4. **FWHM** — for each candidate, walks outward in four axis-aligned directions to the half-maximum level; uses linear interpolation for sub-pixel accuracy; rejects stars with FWHM outside [1.5, 25] px
-5. **Output** — median FWHM in pixels and star count, written to `images.fwhm` / `images.star_count`
-
-Pixel-read errors are silently swallowed so metadata is always indexed even if the pixel data cannot be loaded.
-
 ## Key Dependencies
 
 ### Rust
@@ -242,7 +255,6 @@ Pixel-read errors are silently swallowed so metadata is always indexed even if t
 | `rusqlite` (bundled) | SQLite — no separate install needed |
 | `quick-xml` | XISF XML header parsing |
 | `walkdir` | Recursive directory traversal |
-| `sha2` + `hex` | SHA-256 file hashing |
 | `image` (png feature) | PNG encoding for previews |
 | `base64` | Base64 encoding of preview data URLs |
 | `lz4_flex` | LZ4 decompression for compressed XISF files (N.I.N.A. default) |

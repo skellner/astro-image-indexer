@@ -68,6 +68,25 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
+  // Listen for background quality updates and patch the images array in-place.
+  useEffect(() => {
+    const unlisten = listen<{ file_path: string; fwhm: number | null; star_count: number | null }>(
+      "quality://update",
+      (e) => {
+        const { file_path, fwhm, star_count } = e.payload;
+        setImages((prev) =>
+          prev.map((img) =>
+            img.file_path === file_path ? { ...img, fwhm, star_count } : img
+          )
+        );
+        setSelected((prev) =>
+          prev && prev.file_path === file_path ? { ...prev, fwhm, star_count } : prev
+        );
+      },
+    );
+    return () => { unlisten.then((f) => f()); };
+  }, []);
+
   function handleScanStart() {
     setScanning(true);
     setProgress(null);
@@ -152,7 +171,20 @@ export default function App() {
                   selectedId={selected?.id ?? null}
                 />
                 {selected && (
-                  <DetailPanel image={selected} onClose={() => setSelected(null)} />
+                  <DetailPanel
+                    image={selected}
+                    onClose={() => setSelected(null)}
+                    onQualityComputed={(id, fwhm, starCount) => {
+                      setImages((prev) =>
+                        prev.map((img) =>
+                          img.id === id ? { ...img, fwhm, star_count: starCount } : img
+                        )
+                      );
+                      setSelected((prev) =>
+                        prev && prev.id === id ? { ...prev, fwhm, star_count: starCount } : prev
+                      );
+                    }}
+                  />
                 )}
               </div>
             </>

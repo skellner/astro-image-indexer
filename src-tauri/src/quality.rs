@@ -1,3 +1,14 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use rusqlite::params;
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
+
+use crate::preview;
 use crate::preview::PixelBuffer;
 
 // Limit star-search to a center crop of this size (pixels per side).
@@ -168,4 +179,107 @@ fn measure_fwhm(
     let fwhm_h = walk(1, 0) + walk(-1, 0);
     let fwhm_v = walk(0, 1) + walk(0, -1);
     Some((fwhm_h + fwhm_v) * 0.5)
+}
+
+// ---------------------------------------------------------------------------
+// Background quality backfill worker
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QualityUpdate {
+    pub file_path: String,
+    pub fwhm: Option<f64>,
+    pub star_count: Option<i64>,
+}
+
+/// Spawn a background thread that continuously processes light frames with
+/// missing FWHM/star_count data. Pauses while a scan is in progress.
+pub fn spawn_backfill_worker(
+    conn: Arc<Mutex<rusqlite::Connection>>,
+    is_scanning: Arc<AtomicBool>,
+    app: AppHandle,
+) {
+    thread::spawn(move || {
+        // Small initial delay to let the app finish starting up.
+        thread::sleep(Duration::from_secs(2));
+
+        loop {
+            // Pause while a scan is running.
+            if is_scanning.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
+            // Fetch the next light frame that needs quality analysis.
+            let next = {
+                let Ok(conn) = conn.lock() else { break };
+                conn.query_row(
+                    "SELECT file_path FROM images \
+                     WHERE LOWER(image_type) = 'light' AND fwhm IS NULL \
+                     LIMIT 1",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+            };
+
+            let Some(file_path) = next else {
+                // No pending files — sleep and check again later.
+                thread::sleep(Duration::from_secs(5));
+                continue;
+            };
+
+            // Don't start heavy work if a scan just began.
+            if is_scanning.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            // Load pixels and analyse (this is the heavy part — no lock held).
+            let path = Path::new(&file_path);
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase())
+                .unwrap_or_default();
+
+            let pixel_result = match ext.as_str() {
+                "fits" | "fit" => preview::load_fits_pixels(path),
+                _ => preview::load_xisf_pixels(path),
+            };
+
+            let (fwhm, star_count) = match pixel_result {
+                Ok(buf) => match analyse_stars(&buf) {
+                    Some((f, c)) => (Some(f), Some(c)),
+                    None => (None, None),
+                },
+                Err(_) => (None, None),
+            };
+
+            // Brief lock to write results.
+            {
+                let Ok(conn) = conn.lock() else { break };
+                // Write actual values, or 0-sentinel for fwhm so we don't retry failures.
+                let db_fwhm = fwhm.or(Some(0.0));
+                let _ = conn.execute(
+                    "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
+                    params![db_fwhm, star_count, file_path],
+                );
+            }
+
+            // Notify frontend so the table updates in real time.
+            if fwhm.is_some() {
+                let _ = app.emit(
+                    "quality://update",
+                    QualityUpdate {
+                        file_path,
+                        fwhm,
+                        star_count,
+                    },
+                );
+            }
+
+            // Small pause between files to avoid saturating the CPU / disk.
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
 }
