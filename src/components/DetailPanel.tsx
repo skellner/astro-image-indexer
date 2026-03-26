@@ -87,7 +87,7 @@ export function DetailPanel({ image, onClose }: Props) {
         <Section title="Equipment">
           <Row label="Telescope" value={image.telescope} />
           <Row label="Camera" value={image.instrument} />
-          <Row label="Focal length" value={detail?.focal_length != null ? `${detail.focal_length} mm` : null} />
+          <Row label="Focal length" value={detail?.focal_length != null ? `${Math.round(detail.focal_length)} mm` : null} />
           <Row label="Aperture" value={detail?.aperture != null ? `${detail.aperture} mm` : null} />
           <Row label="Software" value={image.software} />
         </Section>

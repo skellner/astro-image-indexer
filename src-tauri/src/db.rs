@@ -37,6 +37,13 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         conn.execute("INSERT INTO schema_version (version) VALUES (1)", [])?;
     }
 
+    if version < 2 {
+        // focal_length was accidentally stored in metres (XISF native unit);
+        // convert any row where the value looks like metres (< 10) to mm.
+        conn.execute_batch(MIGRATION_2)?;
+        conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])?;
+    }
+
     Ok(())
 }
 
@@ -128,4 +135,13 @@ const MIGRATION_1: &str = "
     CREATE INDEX IF NOT EXISTS idx_images_image_type   ON images(image_type);
     CREATE INDEX IF NOT EXISTS idx_images_instrument   ON images(instrument);
     CREATE INDEX IF NOT EXISTS idx_images_software     ON images(software);
+";
+
+const MIGRATION_2: &str = "
+    -- Fix focal_length values stored in metres instead of mm.
+    -- Telescope focal lengths are always >= 10 mm in practice,
+    -- so any value < 10 was written in metres and needs * 1000.
+    UPDATE images
+        SET focal_length = focal_length * 1000
+        WHERE focal_length IS NOT NULL AND focal_length < 10;
 ";

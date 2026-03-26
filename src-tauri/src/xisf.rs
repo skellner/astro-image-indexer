@@ -249,8 +249,11 @@ fn extract_metadata(
     let instrument = get_prop(&["Instrument:Camera:Name"])
         .or_else(|| get_raw(&["INSTRUME"]));
 
+    // Instrument:Telescope:FocalLength is in metres; convert to mm for DB consistency.
+    // FITS fallback FOCALLEN is already in mm.
     let focal_length = get_prop(&["Instrument:Telescope:FocalLength"])
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|m| m * 1000.0)
         .or_else(|| get_f64(&["FOCALLEN"]));
 
     let ccd_temp = get_prop(&["Instrument:Sensor:Temperature"])

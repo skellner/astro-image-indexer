@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::Utc;
+use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,6 +39,53 @@ pub struct ScanResult {
     pub skipped: usize,
     pub errors: usize,
     pub error_details: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Internal types for parallel scanning
+// ---------------------------------------------------------------------------
+
+struct ExistingRecord {
+    file_size: i64,
+    file_modified_at: Option<String>,
+    file_hash: String,
+    image_type: Option<String>,
+    fwhm: Option<f64>,
+}
+
+enum WorkType {
+    QualityOnly,
+    CheckHash(String), // existing hash to compare against
+    FullIndex,
+}
+
+struct WorkItem {
+    path: PathBuf,
+    work: WorkType,
+    file_size: i64,
+    file_modified: Option<String>,
+}
+
+enum FileResult {
+    QualityUpdate {
+        file_path: String,
+        fwhm: f64,
+        star_count: i64,
+    },
+    FullIndex {
+        file_path: String,
+        file_name: String,
+        file_size: i64,
+        file_modified: Option<String>,
+        hash: String,
+        meta: ImageMetadata,
+        raw: HashMap<String, String>,
+    },
+    StatUpdate {
+        file_path: String,
+        file_size: i64,
+        file_modified: Option<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -74,67 +124,6 @@ pub async fn index_directory(
 #[tauri::command]
 pub fn cancel_scan(state: State<AppState>) {
     state.cancel_flag.store(true, Ordering::Relaxed);
-}
-
-/// Shared scanning logic — works on an already-locked connection.
-fn scan_dir(
-    dir: &str,
-    app: &AppHandle,
-    conn: &Connection,
-    cancel: &std::sync::atomic::AtomicBool,
-) -> Result<ScanResult, String> {
-    let path = PathBuf::from(dir);
-    let files = collect_image_files(&path);
-    let total = files.len();
-
-    let mut result = ScanResult {
-        indexed: 0,
-        skipped: 0,
-        errors: 0,
-        error_details: Vec::new(),
-    };
-
-    // Throttle progress events — emit at most once every 100 ms to avoid
-    // flooding the WebView2 message queue.
-    let throttle = Duration::from_millis(100);
-    let mut last_emit = Instant::now().checked_sub(throttle).unwrap_or_else(Instant::now);
-
-    for (i, file_path) in files.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-
-        let now = Instant::now();
-        if now.duration_since(last_emit) >= throttle {
-            let file_name = file_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let _ = app.emit(
-                "indexer://progress",
-                ScanProgress { current: i + 1, total, file_name },
-            );
-            last_emit = now;
-        }
-
-        match process_file(file_path, conn) {
-            Ok(true) => result.indexed += 1,
-            Ok(false) => result.skipped += 1,
-            Err(e) => {
-                result.errors += 1;
-                result.error_details.push(format!("{}: {e}", file_path.display()));
-            }
-        }
-    }
-
-    conn.execute(
-        "UPDATE scan_directories SET last_scanned_at = ?1 WHERE path = ?2",
-        params![Utc::now().to_rfc3339(), dir],
-    )
-    .map_err(|e| e.to_string())?;
-
-    Ok(result)
 }
 
 /// Re-scan all previously added directories.
@@ -191,6 +180,381 @@ pub async fn rescan_all(app: AppHandle, state: State<'_, AppState>) -> Result<Sc
 }
 
 // ---------------------------------------------------------------------------
+// Three-phase parallel scanner
+// ---------------------------------------------------------------------------
+
+fn scan_dir(
+    dir: &str,
+    app: &AppHandle,
+    conn: &Connection,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<ScanResult, String> {
+    let files = collect_image_files(&PathBuf::from(dir));
+    let total = files.len();
+
+    // ── Phase 1: Classify (serial) ──────────────────────────────────────
+    // Pre-fetch existing DB records into memory so we can classify every
+    // file with a single stat() + HashMap lookup and zero DB round-trips.
+    let existing = prefetch_existing(conn)?;
+
+    let mut work_items: Vec<WorkItem> = Vec::new();
+    let mut skipped = 0usize;
+
+    for file_path in &files {
+        let (file_size, file_modified) = match file_stat(file_path) {
+            Some(s) => s,
+            None => {
+                // Can't stat — will error during processing.
+                work_items.push(WorkItem {
+                    path: file_path.clone(),
+                    work: WorkType::FullIndex,
+                    file_size: 0,
+                    file_modified: None,
+                });
+                continue;
+            }
+        };
+
+        let fp = file_path.to_string_lossy();
+        if let Some(ex) = existing.get(fp.as_ref()) {
+            let stat_match = ex.file_size == file_size
+                && ex.file_modified_at.as_deref() == file_modified.as_deref();
+            if stat_match {
+                let needs_quality =
+                    ex.image_type.as_deref() == Some("Light") && ex.fwhm.is_none();
+                if needs_quality {
+                    work_items.push(WorkItem {
+                        path: file_path.clone(),
+                        work: WorkType::QualityOnly,
+                        file_size,
+                        file_modified,
+                    });
+                } else {
+                    skipped += 1;
+                }
+            } else {
+                work_items.push(WorkItem {
+                    path: file_path.clone(),
+                    work: WorkType::CheckHash(ex.file_hash.clone()),
+                    file_size,
+                    file_modified,
+                });
+            }
+        } else {
+            work_items.push(WorkItem {
+                path: file_path.clone(),
+                work: WorkType::FullIndex,
+                file_size,
+                file_modified,
+            });
+        }
+    }
+
+    // ── Phase 2: Process in parallel (IO + CPU, no DB) ──────────────────
+    // Wrapped in catch_unwind so a panic in any rayon worker thread does
+    // NOT poison the Mutex<Connection> (which is held by our caller).
+    let done_count = AtomicUsize::new(skipped);
+    let last_emit = StdMutex::new(
+        Instant::now()
+            .checked_sub(Duration::from_millis(100))
+            .unwrap_or_else(Instant::now),
+    );
+    let throttle = Duration::from_millis(100);
+
+    let parallel_result = catch_unwind(AssertUnwindSafe(|| {
+        work_items
+            .par_iter()
+            .map(|item| {
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(None);
+                }
+
+                // Throttled progress event.
+                let n = done_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Ok(mut le) = last_emit.lock() {
+                    let now = Instant::now();
+                    if now.duration_since(*le) >= throttle {
+                        let fname = item
+                            .path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let _ = app.emit(
+                            "indexer://progress",
+                            ScanProgress {
+                                current: n,
+                                total,
+                                file_name: fname,
+                            },
+                        );
+                        *le = now;
+                    }
+                }
+
+                match &item.work {
+                    WorkType::QualityOnly => process_quality_only(&item.path),
+                    WorkType::CheckHash(existing_hash) => {
+                        let hash = sha256_file(&item.path).map_err(|e| e.to_string())?;
+                        if hash == *existing_hash {
+                            Ok(Some(FileResult::StatUpdate {
+                                file_path: item.path.to_string_lossy().to_string(),
+                                file_size: item.file_size,
+                                file_modified: item.file_modified.clone(),
+                            }))
+                        } else {
+                            process_full_index(
+                                &item.path,
+                                item.file_size,
+                                item.file_modified.clone(),
+                                hash,
+                            )
+                        }
+                    }
+                    WorkType::FullIndex => {
+                        let hash = sha256_file(&item.path).map_err(|e| e.to_string())?;
+                        process_full_index(
+                            &item.path,
+                            item.file_size,
+                            item.file_modified.clone(),
+                            hash,
+                        )
+                    }
+                }
+            })
+            .collect::<Vec<_>>()
+    }));
+
+    let results = match parallel_result {
+        Ok(r) => r,
+        Err(_) => {
+            return Err("Internal error: scan worker thread panicked".into());
+        }
+    };
+
+    // ── Phase 3: Batch write to DB (serial, one transaction) ────────────
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+
+    let mut result = ScanResult {
+        indexed: 0,
+        skipped,
+        errors: 0,
+        error_details: Vec::new(),
+    };
+
+    for r in results {
+        match r {
+            Ok(Some(FileResult::QualityUpdate {
+                file_path,
+                fwhm,
+                star_count,
+            })) => match conn.execute(
+                "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
+                params![fwhm, star_count, file_path],
+            ) {
+                Ok(_) => result.indexed += 1,
+                Err(e) => {
+                    result.errors += 1;
+                    result.error_details.push(format!("{file_path}: {e}"));
+                }
+            },
+            Ok(Some(FileResult::FullIndex {
+                file_path,
+                file_name,
+                file_size,
+                file_modified,
+                hash,
+                meta,
+                raw,
+            })) => match upsert_and_headers(
+                conn,
+                &file_path,
+                &file_name,
+                file_size,
+                file_modified.as_deref(),
+                &hash,
+                &meta,
+                &raw,
+            ) {
+                Ok(()) => result.indexed += 1,
+                Err(e) => {
+                    result.errors += 1;
+                    result.error_details.push(format!("{file_path}: {e}"));
+                }
+            },
+            Ok(Some(FileResult::StatUpdate {
+                file_path,
+                file_size,
+                file_modified,
+            })) => {
+                let _ = conn.execute(
+                    "UPDATE images SET file_size = ?1, file_modified_at = ?2 WHERE file_path = ?3",
+                    params![file_size, file_modified, file_path],
+                );
+                result.skipped += 1;
+            }
+            Ok(None) => {
+                // Cancelled or quality analysis silently failed.
+                result.skipped += 1;
+            }
+            Err(e) => {
+                result.errors += 1;
+                result.error_details.push(e);
+            }
+        }
+    }
+
+    // Commit; if it fails, rollback so the connection isn't left in a dirty state.
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(format!("DB commit failed: {e}"));
+    }
+
+    conn.execute(
+        "UPDATE scan_directories SET last_scanned_at = ?1 WHERE path = ?2",
+        params![Utc::now().to_rfc3339(), dir],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Emit final progress so the UI shows 100%.
+    let _ = app.emit(
+        "indexer://progress",
+        ScanProgress {
+            current: total,
+            total,
+            file_name: String::new(),
+        },
+    );
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Phase-2 helpers (called from rayon threads — no DB access)
+// ---------------------------------------------------------------------------
+
+fn process_quality_only(path: &Path) -> Result<Option<FileResult>, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let pixel_result = match ext.as_str() {
+        "fits" | "fit" => preview::load_fits_pixels(path),
+        _ => preview::load_xisf_pixels(path),
+    };
+    if let Ok(buf) = pixel_result {
+        if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
+            return Ok(Some(FileResult::QualityUpdate {
+                file_path: path.to_string_lossy().to_string(),
+                fwhm,
+                star_count: count,
+            }));
+        }
+    }
+    Ok(None) // pixel load or analysis failed — skip silently
+}
+
+fn process_full_index(
+    path: &Path,
+    file_size: i64,
+    file_modified: Option<String>,
+    hash: String,
+) -> Result<Option<FileResult>, String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let (mut meta, raw) = match ext.as_str() {
+        "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
+        "xisf" => xisf::parse(path).map_err(|e| e.to_string())?,
+        _ => return Err(format!("Unsupported extension: {ext}")),
+    };
+
+    // For light frames, compute FWHM + star count (errors silently ignored).
+    if meta.image_type.as_deref() == Some("Light") {
+        let pixel_result = match ext.as_str() {
+            "fits" | "fit" => preview::load_fits_pixels(path),
+            _ => preview::load_xisf_pixels(path),
+        };
+        if let Ok(buf) = pixel_result {
+            if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
+                meta.fwhm = Some(fwhm);
+                meta.star_count = Some(count);
+            }
+        }
+    }
+
+    Ok(Some(FileResult::FullIndex {
+        file_path: path.to_string_lossy().to_string(),
+        file_name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string(),
+        file_size,
+        file_modified,
+        hash,
+        meta,
+        raw,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Prefetch + classify helpers
+// ---------------------------------------------------------------------------
+
+fn prefetch_existing(conn: &Connection) -> Result<HashMap<String, ExistingRecord>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_path, file_size, file_modified_at, file_hash, image_type, fwhm \
+             FROM images",
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut map = HashMap::new();
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ExistingRecord {
+                    file_size: r.get(1)?,
+                    file_modified_at: r.get(2)?,
+                    file_hash: r.get(3)?,
+                    image_type: r.get(4)?,
+                    fwhm: r.get(5)?,
+                },
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        let (path, record) = row.map_err(|e| e.to_string())?;
+        map.insert(path, record);
+    }
+
+    Ok(map)
+}
+
+fn file_stat(path: &Path) -> Option<(i64, Option<String>)> {
+    let m = fs::metadata(path).ok()?;
+    let size = m.len() as i64;
+    let modified = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| {
+            chrono::DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0)
+                .unwrap_or_default()
+                .to_rfc3339()
+        });
+    Some((size, modified))
+}
+
+// ---------------------------------------------------------------------------
 // File collection
 // ---------------------------------------------------------------------------
 
@@ -216,116 +580,19 @@ fn is_image_file(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Per-file processing
+// Database writes (Phase 3 — serial)
 // ---------------------------------------------------------------------------
 
-/// Returns Ok(true) if indexed, Ok(false) if skipped (unchanged), Err on failure.
-fn process_file(path: &Path, conn: &Connection) -> Result<bool, String> {
-    let fs_meta = fs::metadata(path).map_err(|e| e.to_string())?;
-    let file_size = fs_meta.len() as i64;
-    let file_modified = fs_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| {
-            chrono::DateTime::<Utc>::from_timestamp(d.as_secs() as i64, 0)
-                .unwrap_or_default()
-                .to_rfc3339()
-        });
-
-    let hash = sha256_file(path).map_err(|e| e.to_string())?;
-
-    // Check existing record: hash, image_type, and whether quality data exists
-    let existing: Option<(String, Option<String>, Option<f64>)> = conn
-        .query_row(
-            "SELECT file_hash, image_type, fwhm FROM images WHERE file_path = ?1",
-            params![path.to_string_lossy().as_ref()],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-
-    if let Some((ref existing_hash, ref existing_type, ref existing_fwhm)) = existing {
-        if existing_hash == &hash {
-            // File unchanged. Skip unless it's a light frame that still needs quality data.
-            let needs_quality = existing_type.as_deref() == Some("Light") && existing_fwhm.is_none();
-            if !needs_quality {
-                return Ok(false);
-            }
-
-            // Light frame with no quality data yet: compute and update, then return.
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.to_ascii_lowercase())
-                .unwrap_or_default();
-            let pixel_result = match ext.as_str() {
-                "fits" | "fit" => preview::load_fits_pixels(path),
-                _ => preview::load_xisf_pixels(path),
-            };
-            if let Ok(buf) = pixel_result {
-                if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
-                    conn.execute(
-                        "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
-                        params![fwhm, count, path.to_string_lossy().as_ref()],
-                    )
-                    .map_err(|e| e.to_string())?;
-                }
-            }
-            return Ok(true);
-        }
-    }
-
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let (mut meta, raw) = match ext.as_str() {
-        "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
-        "xisf" => xisf::parse(path).map_err(|e| e.to_string())?,
-        _ => return Err(format!("Unsupported extension: {ext}")),
-    };
-
-    // For light frames, read pixel data and compute FWHM + star count.
-    // Errors are silently ignored — the file is still indexed without quality data.
-    if meta.image_type.as_deref() == Some("Light") {
-        let pixel_result = match ext.as_str() {
-            "fits" | "fit" => preview::load_fits_pixels(path),
-            _ => preview::load_xisf_pixels(path),
-        };
-        if let Ok(buf) = pixel_result {
-            if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
-                meta.fwhm = Some(fwhm);
-                meta.star_count = Some(count);
-            }
-        }
-    }
-
-    upsert_image(conn, path, file_size, file_modified, hash, &meta)?;
-    upsert_raw_headers(conn, path, &raw)?;
-
-    Ok(true)
-}
-
-// ---------------------------------------------------------------------------
-// Database writes
-// ---------------------------------------------------------------------------
-
-fn upsert_image(
+fn upsert_and_headers(
     conn: &Connection,
-    path: &Path,
+    file_path: &str,
+    file_name: &str,
     file_size: i64,
-    file_modified: Option<String>,
-    hash: String,
+    file_modified: Option<&str>,
+    hash: &str,
     meta: &ImageMetadata,
+    raw: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let file_path = path.to_string_lossy().to_string();
-    let file_name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
     let now = Utc::now().to_rfc3339();
 
     conn.execute(
@@ -397,23 +664,15 @@ fn upsert_image(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(())
-}
-
-fn upsert_raw_headers(
-    conn: &Connection,
-    path: &Path,
-    raw: &HashMap<String, String>,
-) -> Result<(), String> {
+    // Replace raw headers for this image.
     let image_id: i64 = conn
         .query_row(
             "SELECT id FROM images WHERE file_path = ?1",
-            params![path.to_string_lossy().as_ref()],
+            params![file_path],
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())?;
 
-    // Replace all headers for this image
     conn.execute(
         "DELETE FROM raw_headers WHERE image_id = ?1",
         params![image_id],

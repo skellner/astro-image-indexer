@@ -17,6 +17,19 @@ function toDateKey(dateObs: string): string {
   return dateObs.slice(0, 10); // "YYYY-MM-DD"
 }
 
+/** Format total seconds as e.g. "1h 23m" or "45m" or "30s". */
+function formatExposure(seconds: number): string {
+  if (seconds >= 3600) {
+    const h = Math.floor(seconds / 3600);
+    const m = Math.round((seconds % 3600) / 60);
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  if (seconds >= 60) {
+    return `${Math.round(seconds / 60)}m`;
+  }
+  return `${Math.round(seconds)}s`;
+}
+
 export function CalendarView({ images }: Props) {
   // Default to the month of the most recent image, or current month.
   const defaultMonth = useMemo(() => {
@@ -36,16 +49,17 @@ export function CalendarView({ images }: Props) {
   const [year, setYear] = useState(defaultMonth.year);
   const [month, setMonth] = useState(defaultMonth.month);
 
-  // Build a map: "YYYY-MM-DD" -> { objects: string[], count: number }
+  // Build a map: "YYYY-MM-DD" -> { objects, count, totalExposureSec }
   const dayMap = useMemo(() => {
-    const map = new Map<string, { objects: Set<string>; count: number }>();
+    const map = new Map<string, { objects: Set<string>; count: number; totalExposureSec: number }>();
     for (const img of images) {
       if (!img.date_obs) continue;
       const key = toDateKey(img.date_obs);
-      if (!map.has(key)) map.set(key, { objects: new Set(), count: 0 });
+      if (!map.has(key)) map.set(key, { objects: new Set(), count: 0, totalExposureSec: 0 });
       const entry = map.get(key)!;
       if (img.object_name) entry.objects.add(img.object_name);
       entry.count++;
+      if (img.exposure_time != null) entry.totalExposureSec += img.exposure_time;
     }
     return map;
   }, [images]);
@@ -132,9 +146,12 @@ export function CalendarView({ images }: Props) {
               {/* Objects */}
               {entry && (
                 <div className="flex flex-col gap-0.5 flex-1 min-h-0">
-                  {/* Count badge */}
+                  {/* Count + exposure */}
                   <span className="text-[10px] text-gray-500 leading-none mb-0.5">
                     {entry.count} frame{entry.count !== 1 ? "s" : ""}
+                    {entry.totalExposureSec > 0 && (
+                      <> · {formatExposure(entry.totalExposureSec)}</>
+                    )}
                   </span>
                   {/* Object names */}
                   {Array.from(entry.objects).slice(0, 3).map((obj) => (
