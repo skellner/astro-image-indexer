@@ -122,19 +122,13 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 
 ## Scanning Design
 
-### Three-phase parallel architecture
-
-Scanning uses a three-phase pipeline for maximum throughput:
-
-| Phase | Work | Threading |
-|---|---|---|
-| 1. **Classify** | `stat()` each file + HashMap lookup against pre-fetched DB records | Serial (fast — just syscalls) |
-| 2. **Process** | SHA-256 hashing, metadata parsing, FWHM/star analysis | **Parallel** via `rayon` (all CPU cores) |
-| 3. **Write DB** | Upsert images + raw headers | Serial, single `BEGIN`/`COMMIT` transaction |
-
 ### Fast skip (mtime + size)
 
-Before computing a SHA-256 hash (which reads the entire file), the scanner checks if the file's size and modification time match the existing DB record. If both match, the file is assumed unchanged and skipped with zero disk IO. This makes rescan of an unchanged library nearly instant.
+Before computing a SHA-256 hash (which reads the entire file), the scanner checks if the file's size and modification time match a pre-fetched in-memory cache of all existing DB records. If both match, the file is assumed unchanged and skipped with zero disk IO. This makes rescan of an unchanged library nearly instant — a single `stat()` + HashMap lookup per file, no file reads at all.
+
+### Batched transactions
+
+All DB writes within a scan are wrapped in a single `BEGIN`/`COMMIT` transaction (committed every 200 files). This eliminates the per-file `fsync` overhead that SQLite normally imposes, giving a large write throughput improvement. On commit failure, the transaction is rolled back to keep the connection clean.
 
 ### Async execution
 
@@ -142,20 +136,16 @@ Before computing a SHA-256 hash (which reads the entire file), the scanner check
 
 ### Cancellation
 
-`AppState` holds an `Arc<AtomicBool>` cancel flag shared between the command handlers and the rayon worker threads.
+`AppState` holds an `Arc<AtomicBool>` cancel flag shared between the command handlers and `scan_dir`.
 
 1. Any new scan resets the flag to `false` before starting.
 2. `cancel_scan` sets it to `true` from the frontend at any time.
-3. Each rayon worker checks the flag before processing a file and returns early if set.
+3. `scan_dir` checks the flag at the top of each file iteration and breaks early if set.
 4. The frontend dismisses the popup immediately on cancel without waiting for the scan to return.
-
-### Panic safety
-
-The parallel processing phase is wrapped in `std::panic::catch_unwind` so that a panic in any rayon worker thread does not poison the `Mutex<Connection>`. Without this, a single bad file could make all subsequent DB operations fail until the app is restarted. Transaction failures trigger an explicit `ROLLBACK` to keep the connection clean.
 
 ### Progress throttling
 
-Worker threads share an `AtomicUsize` counter and a `Mutex<Instant>` for last-emit tracking. Progress events are emitted at most once per 100 ms to prevent flooding WebView2's message queue. The frontend shows elapsed time and an estimated ETA based on the processing rate.
+`scan_dir` tracks the last emit time with `std::time::Instant` and skips the `app.emit()` call unless at least 100 ms have elapsed. This prevents flooding WebView2's message queue on large libraries. The frontend shows elapsed time and an estimated ETA based on the processing rate.
 
 ### Progress popup
 
@@ -256,7 +246,6 @@ Pixel-read errors are silently swallowed so metadata is always indexed even if t
 | `image` (png feature) | PNG encoding for previews |
 | `base64` | Base64 encoding of preview data URLs |
 | `lz4_flex` | LZ4 decompression for compressed XISF files (N.I.N.A. default) |
-| `rayon` | Parallel file processing (hashing, parsing, quality analysis) |
 | `chrono` | Date/time parsing |
 | `serde` / `serde_json` | Serialization across the IPC boundary |
 | `thiserror` | Ergonomic error types |

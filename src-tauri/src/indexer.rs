@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex as StdMutex;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::Utc;
-use rayon::prelude::*;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,7 +39,7 @@ pub struct ScanResult {
 }
 
 // ---------------------------------------------------------------------------
-// Internal types for parallel scanning
+// Internal types
 // ---------------------------------------------------------------------------
 
 struct ExistingRecord {
@@ -51,41 +48,6 @@ struct ExistingRecord {
     file_hash: String,
     image_type: Option<String>,
     fwhm: Option<f64>,
-}
-
-enum WorkType {
-    QualityOnly,
-    CheckHash(String), // existing hash to compare against
-    FullIndex,
-}
-
-struct WorkItem {
-    path: PathBuf,
-    work: WorkType,
-    file_size: i64,
-    file_modified: Option<String>,
-}
-
-enum FileResult {
-    QualityUpdate {
-        file_path: String,
-        fwhm: f64,
-        star_count: i64,
-    },
-    FullIndex {
-        file_path: String,
-        file_name: String,
-        file_size: i64,
-        file_modified: Option<String>,
-        hash: String,
-        meta: ImageMetadata,
-        raw: HashMap<String, String>,
-    },
-    StatUpdate {
-        file_path: String,
-        file_size: i64,
-        file_modified: Option<String>,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +142,7 @@ pub async fn rescan_all(app: AppHandle, state: State<'_, AppState>) -> Result<Sc
 }
 
 // ---------------------------------------------------------------------------
-// Three-phase parallel scanner
+// Scanner
 // ---------------------------------------------------------------------------
 
 fn scan_dir(
@@ -192,220 +154,70 @@ fn scan_dir(
     let files = collect_image_files(&PathBuf::from(dir));
     let total = files.len();
 
-    // ── Phase 1: Classify (serial) ──────────────────────────────────────
-    // Pre-fetch existing DB records into memory so we can classify every
-    // file with a single stat() + HashMap lookup and zero DB round-trips.
+    // Pre-fetch existing DB records so skip-checking needs no per-file query.
     let existing = prefetch_existing(conn)?;
-
-    let mut work_items: Vec<WorkItem> = Vec::new();
-    let mut skipped = 0usize;
-
-    for file_path in &files {
-        let (file_size, file_modified) = match file_stat(file_path) {
-            Some(s) => s,
-            None => {
-                // Can't stat — will error during processing.
-                work_items.push(WorkItem {
-                    path: file_path.clone(),
-                    work: WorkType::FullIndex,
-                    file_size: 0,
-                    file_modified: None,
-                });
-                continue;
-            }
-        };
-
-        let fp = file_path.to_string_lossy();
-        if let Some(ex) = existing.get(fp.as_ref()) {
-            let stat_match = ex.file_size == file_size
-                && ex.file_modified_at.as_deref() == file_modified.as_deref();
-            if stat_match {
-                let needs_quality =
-                    ex.image_type.as_deref() == Some("Light") && ex.fwhm.is_none();
-                if needs_quality {
-                    work_items.push(WorkItem {
-                        path: file_path.clone(),
-                        work: WorkType::QualityOnly,
-                        file_size,
-                        file_modified,
-                    });
-                } else {
-                    skipped += 1;
-                }
-            } else {
-                work_items.push(WorkItem {
-                    path: file_path.clone(),
-                    work: WorkType::CheckHash(ex.file_hash.clone()),
-                    file_size,
-                    file_modified,
-                });
-            }
-        } else {
-            work_items.push(WorkItem {
-                path: file_path.clone(),
-                work: WorkType::FullIndex,
-                file_size,
-                file_modified,
-            });
-        }
-    }
-
-    // ── Phase 2: Process in parallel (IO + CPU, no DB) ──────────────────
-    // Wrapped in catch_unwind so a panic in any rayon worker thread does
-    // NOT poison the Mutex<Connection> (which is held by our caller).
-    let done_count = AtomicUsize::new(skipped);
-    let last_emit = StdMutex::new(
-        Instant::now()
-            .checked_sub(Duration::from_millis(100))
-            .unwrap_or_else(Instant::now),
-    );
-    let throttle = Duration::from_millis(100);
-
-    let parallel_result = catch_unwind(AssertUnwindSafe(|| {
-        work_items
-            .par_iter()
-            .map(|item| {
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(None);
-                }
-
-                // Throttled progress event.
-                let n = done_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Ok(mut le) = last_emit.lock() {
-                    let now = Instant::now();
-                    if now.duration_since(*le) >= throttle {
-                        let fname = item
-                            .path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let _ = app.emit(
-                            "indexer://progress",
-                            ScanProgress {
-                                current: n,
-                                total,
-                                file_name: fname,
-                            },
-                        );
-                        *le = now;
-                    }
-                }
-
-                match &item.work {
-                    WorkType::QualityOnly => process_quality_only(&item.path),
-                    WorkType::CheckHash(existing_hash) => {
-                        let hash = sha256_file(&item.path).map_err(|e| e.to_string())?;
-                        if hash == *existing_hash {
-                            Ok(Some(FileResult::StatUpdate {
-                                file_path: item.path.to_string_lossy().to_string(),
-                                file_size: item.file_size,
-                                file_modified: item.file_modified.clone(),
-                            }))
-                        } else {
-                            process_full_index(
-                                &item.path,
-                                item.file_size,
-                                item.file_modified.clone(),
-                                hash,
-                            )
-                        }
-                    }
-                    WorkType::FullIndex => {
-                        let hash = sha256_file(&item.path).map_err(|e| e.to_string())?;
-                        process_full_index(
-                            &item.path,
-                            item.file_size,
-                            item.file_modified.clone(),
-                            hash,
-                        )
-                    }
-                }
-            })
-            .collect::<Vec<_>>()
-    }));
-
-    let results = match parallel_result {
-        Ok(r) => r,
-        Err(_) => {
-            return Err("Internal error: scan worker thread panicked".into());
-        }
-    };
-
-    // ── Phase 3: Batch write to DB (serial, one transaction) ────────────
-    conn.execute_batch("BEGIN DEFERRED")
-        .map_err(|e| e.to_string())?;
 
     let mut result = ScanResult {
         indexed: 0,
-        skipped,
+        skipped: 0,
         errors: 0,
         error_details: Vec::new(),
     };
 
-    for r in results {
-        match r {
-            Ok(Some(FileResult::QualityUpdate {
-                file_path,
-                fwhm,
-                star_count,
-            })) => match conn.execute(
-                "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
-                params![fwhm, star_count, file_path],
-            ) {
-                Ok(_) => result.indexed += 1,
-                Err(e) => {
-                    result.errors += 1;
-                    result.error_details.push(format!("{file_path}: {e}"));
-                }
-            },
-            Ok(Some(FileResult::FullIndex {
-                file_path,
-                file_name,
-                file_size,
-                file_modified,
-                hash,
-                meta,
-                raw,
-            })) => match upsert_and_headers(
-                conn,
-                &file_path,
-                &file_name,
-                file_size,
-                file_modified.as_deref(),
-                &hash,
-                &meta,
-                &raw,
-            ) {
-                Ok(()) => result.indexed += 1,
-                Err(e) => {
-                    result.errors += 1;
-                    result.error_details.push(format!("{file_path}: {e}"));
-                }
-            },
-            Ok(Some(FileResult::StatUpdate {
-                file_path,
-                file_size,
-                file_modified,
-            })) => {
-                let _ = conn.execute(
-                    "UPDATE images SET file_size = ?1, file_modified_at = ?2 WHERE file_path = ?3",
-                    params![file_size, file_modified, file_path],
-                );
-                result.skipped += 1;
-            }
-            Ok(None) => {
-                // Cancelled or quality analysis silently failed.
-                result.skipped += 1;
-            }
+    let throttle = Duration::from_millis(100);
+    let mut last_emit = Instant::now()
+        .checked_sub(throttle)
+        .unwrap_or_else(Instant::now);
+
+    // All DB writes in one transaction for speed (commit every 200 files).
+    const BATCH: usize = 200;
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+
+    for (i, file_path) in files.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Throttled progress event.
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= throttle {
+            let file_name = file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let _ = app.emit(
+                "indexer://progress",
+                ScanProgress {
+                    current: i + 1,
+                    total,
+                    file_name,
+                },
+            );
+            last_emit = now;
+        }
+
+        match process_file(file_path, conn, &existing) {
+            Ok(true) => result.indexed += 1,
+            Ok(false) => result.skipped += 1,
             Err(e) => {
                 result.errors += 1;
-                result.error_details.push(e);
+                result.error_details
+                    .push(format!("{}: {e}", file_path.display()));
+            }
+        }
+
+        // Commit in batches to bound memory.
+        if (i + 1) % BATCH == 0 {
+            if let Err(e) = conn.execute_batch("COMMIT; BEGIN DEFERRED") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(format!("DB batch commit failed: {e}"));
             }
         }
     }
 
-    // Commit; if it fails, rollback so the connection isn't left in a dirty state.
+    // Final commit; rollback on failure so connection stays clean.
     if let Err(e) = conn.execute_batch("COMMIT") {
         let _ = conn.execute_batch("ROLLBACK");
         return Err(format!("DB commit failed: {e}"));
@@ -417,56 +229,83 @@ fn scan_dir(
     )
     .map_err(|e| e.to_string())?;
 
-    // Emit final progress so the UI shows 100%.
-    let _ = app.emit(
-        "indexer://progress",
-        ScanProgress {
-            current: total,
-            total,
-            file_name: String::new(),
-        },
-    );
-
     Ok(result)
 }
 
 // ---------------------------------------------------------------------------
-// Phase-2 helpers (called from rayon threads — no DB access)
+// Per-file processing
 // ---------------------------------------------------------------------------
 
-fn process_quality_only(path: &Path) -> Result<Option<FileResult>, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let pixel_result = match ext.as_str() {
-        "fits" | "fit" => preview::load_fits_pixels(path),
-        _ => preview::load_xisf_pixels(path),
-    };
-    if let Ok(buf) = pixel_result {
-        if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
-            return Ok(Some(FileResult::QualityUpdate {
-                file_path: path.to_string_lossy().to_string(),
-                fwhm,
-                star_count: count,
-            }));
+/// Returns Ok(true) if indexed, Ok(false) if skipped (unchanged), Err on failure.
+fn process_file(
+    path: &Path,
+    conn: &Connection,
+    existing: &HashMap<String, ExistingRecord>,
+) -> Result<bool, String> {
+    let (file_size, file_modified) = file_stat(path)?;
+
+    let fp = path.to_string_lossy();
+
+    // Fast path: mtime + size match → skip without reading the file at all.
+    if let Some(ex) = existing.get(fp.as_ref()) {
+        let stat_match =
+            ex.file_size == file_size && ex.file_modified_at.as_deref() == file_modified.as_deref();
+
+        if stat_match {
+            // File unchanged. Skip unless it's a light frame missing quality data.
+            let needs_quality =
+                ex.image_type.as_deref() == Some("Light") && ex.fwhm.is_none();
+            if !needs_quality {
+                return Ok(false);
+            }
+
+            // Compute quality only.
+            let ext = extension_lower(path);
+            let pixel_result = match ext.as_str() {
+                "fits" | "fit" => preview::load_fits_pixels(path),
+                _ => preview::load_xisf_pixels(path),
+            };
+            if let Ok(buf) = pixel_result {
+                if let Some((fwhm, count)) = quality::analyse_stars(&buf) {
+                    conn.execute(
+                        "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
+                        params![fwhm, count, fp.as_ref()],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            return Ok(true);
         }
+
+        // Stat changed — hash to check if content really changed.
+        let hash = sha256_file(path).map_err(|e| e.to_string())?;
+        if hash == ex.file_hash {
+            // Content identical; just refresh stat columns.
+            conn.execute(
+                "UPDATE images SET file_size = ?1, file_modified_at = ?2 WHERE file_path = ?3",
+                params![file_size, file_modified, fp.as_ref()],
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(false);
+        }
+
+        // Content changed — fall through to full index.
+        return full_index(path, conn, file_size, file_modified, hash);
     }
-    Ok(None) // pixel load or analysis failed — skip silently
+
+    // New file — hash + full parse.
+    let hash = sha256_file(path).map_err(|e| e.to_string())?;
+    full_index(path, conn, file_size, file_modified, hash)
 }
 
-fn process_full_index(
+fn full_index(
     path: &Path,
+    conn: &Connection,
     file_size: i64,
     file_modified: Option<String>,
     hash: String,
-) -> Result<Option<FileResult>, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
+) -> Result<bool, String> {
+    let ext = extension_lower(path);
 
     let (mut meta, raw) = match ext.as_str() {
         "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
@@ -488,23 +327,12 @@ fn process_full_index(
         }
     }
 
-    Ok(Some(FileResult::FullIndex {
-        file_path: path.to_string_lossy().to_string(),
-        file_name: path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string(),
-        file_size,
-        file_modified,
-        hash,
-        meta,
-        raw,
-    }))
+    upsert_and_headers(path, conn, file_size, file_modified, hash, &meta, &raw)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
-// Prefetch + classify helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn prefetch_existing(conn: &Connection) -> Result<HashMap<String, ExistingRecord>, String> {
@@ -535,12 +363,11 @@ fn prefetch_existing(conn: &Connection) -> Result<HashMap<String, ExistingRecord
         let (path, record) = row.map_err(|e| e.to_string())?;
         map.insert(path, record);
     }
-
     Ok(map)
 }
 
-fn file_stat(path: &Path) -> Option<(i64, Option<String>)> {
-    let m = fs::metadata(path).ok()?;
+fn file_stat(path: &Path) -> Result<(i64, Option<String>), String> {
+    let m = fs::metadata(path).map_err(|e| e.to_string())?;
     let size = m.len() as i64;
     let modified = m
         .modified()
@@ -551,7 +378,14 @@ fn file_stat(path: &Path) -> Option<(i64, Option<String>)> {
                 .unwrap_or_default()
                 .to_rfc3339()
         });
-    Some((size, modified))
+    Ok((size, modified))
+}
+
+fn extension_lower(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -580,19 +414,24 @@ fn is_image_file(path: &Path) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Database writes (Phase 3 — serial)
+// Database writes
 // ---------------------------------------------------------------------------
 
 fn upsert_and_headers(
+    path: &Path,
     conn: &Connection,
-    file_path: &str,
-    file_name: &str,
     file_size: i64,
-    file_modified: Option<&str>,
-    hash: &str,
+    file_modified: Option<String>,
+    hash: String,
     meta: &ImageMetadata,
     raw: &HashMap<String, String>,
 ) -> Result<(), String> {
+    let file_path = path.to_string_lossy().to_string();
+    let file_name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let now = Utc::now().to_rfc3339();
 
     conn.execute(
