@@ -9,16 +9,16 @@ A Tauri 2 desktop application for Windows that scans local directories, parses m
 - Fast change detection via mtime + file size — unchanged files are skipped on rescan
 - Full-text search and filtering by object name, image type, and filter
 - Sortable image table with FWHM and star-count columns for light frames
-- **Calendar view** — monthly grid showing which objects were imaged each day, with month navigation
+- **Calendar view** — monthly grid showing which objects were imaged each day, with moon phase icons and month navigation
 - **Image preview** — auto-stretched grayscale thumbnail in the detail panel (FITS and XISF, including LZ4/LZ4+sh-compressed files)
-- **Background quality analysis** — FWHM and star count computed automatically for light frames after scanning; results stream into the table in real time
+- **Background quality analysis** — FWHM and star count computed automatically for light frames after scanning; results stream into the table in real time with a progress bar in the title area
 - **On-demand quality** — clicking a light frame in the detail panel triggers immediate quality analysis if not yet computed
 - Click a directory in the sidebar to open it in Windows Explorer
 - Double-click a table row to open the file with its default application
 - Raw header/property storage for arbitrary ad-hoc queries
 - Library statistics (total images, unique objects/filters, total exposure hours)
-- Non-blocking async scanning with a cancellable progress popup
-- Real-time scan progress events (throttled to 100 ms) with elapsed time and ETA
+- Non-blocking async scanning with a cancellable progress popup; cancelling preserves all already-indexed files
+- Real-time scan progress events (throttled to 100 ms) with elapsed time and smoothed ETA
 
 ## Requirements
 
@@ -91,11 +91,11 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | Component | Responsibility |
 |---|---|
 | `App.tsx` | Root state management (directories, images, filters, scan progress, active view); listens for background quality events |
-| `TopBar.tsx` | Library stats, Add Directory and Rescan All buttons |
+| `TopBar.tsx` | Library stats, Add Directory and Rescan All buttons, background quality progress bar |
 | `Sidebar.tsx` | Directory list; clicking a directory opens it in Windows Explorer |
 | `FilterBar.tsx` | Search input and image type / filter / object dropdowns |
 | `ImageTable.tsx` | Sortable table of indexed images including FWHM and star-count columns; double-click opens file |
-| `CalendarView.tsx` | Monthly calendar grid; each day shows object names and total exposure for frames taken that night |
+| `CalendarView.tsx` | Monthly calendar grid; each day shows moon phase icon, object names, and total exposure for frames taken that night |
 | `DetailPanel.tsx` | Full metadata view for the selected image, including auto-stretched preview and on-demand quality analysis |
 | `ScanProgress.tsx` | Modal progress popup with cancel button, elapsed time, ETA; rendered via React portal |
 
@@ -106,16 +106,16 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `index_directory` | `dir: string` | `ScanResult` | async; registers dir and scans it |
 | `rescan_all` | — | `ScanResult` | async; rescans all registered dirs |
 | `cancel_scan` | — | `void` | sets cancel flag; scan stops at next file |
-| `list_images` | `search?, image_type?, filter_name?, object_name?` | `ImageRow[]` | |
-| `get_image_detail` | `id: number` | `ImageDetail` | |
+| `list_images` | `search?, image_type?, filter_name?, object_name?` | `ImageRow[]` | async; runs on blocking thread |
+| `get_image_detail` | `id: number` | `ImageDetail` | async; runs on blocking thread |
 | `get_image_preview` | `file_path: string` | `string` (data URL) | async; returns base64 PNG |
 | `compute_quality` | `file_path: string` | `QualityResult` | async; computes FWHM + star count on demand |
 | `open_file` | `path: string` | `void` | opens file with its default Windows application |
-| `get_object_options` | — | `string[]` | distinct object names for filter dropdown |
-| `list_directories` | — | `DirectoryEntry[]` | |
-| `remove_directory` | `path: string` | `void` | |
-| `get_library_stats` | — | `LibraryStats` | |
-| `get_filter_options` | — | `string[]` | |
+| `get_object_options` | — | `string[]` | async; runs on blocking thread |
+| `list_directories` | — | `DirectoryEntry[]` | async; runs on blocking thread |
+| `remove_directory` | `path: string` | `void` | async; runs on blocking thread |
+| `get_library_stats` | — | `LibraryStats` | async; runs on blocking thread |
+| `get_filter_options` | — | `string[]` | async; runs on blocking thread |
 
 **Events emitted by Rust:**
 
@@ -136,11 +136,11 @@ Before parsing, the scanner checks if the file's size and modification time matc
 
 ### Batched transactions
 
-All DB writes within a scan are wrapped in a single `BEGIN`/`COMMIT` transaction (committed every 200 files). This eliminates the per-file `fsync` overhead that SQLite normally imposes, giving a large write throughput improvement. On commit failure, the transaction is rolled back to keep the connection clean.
+DB writes are grouped into batches of 50 files, each wrapped in a `BEGIN`/`COMMIT` transaction. This eliminates the per-file `fsync` overhead that SQLite imposes and, critically, releases the `Mutex<Connection>` between batches so UI queries (which also need the lock) are never blocked for more than one batch at a time. On commit failure the transaction is rolled back to keep the connection clean.
 
 ### Async execution
 
-`index_directory` and `rescan_all` are `async` Tauri commands. The actual file work runs inside `tauri::async_runtime::spawn_blocking`, which moves it off the async runtime onto a dedicated blocking thread. This keeps the Tauri IPC loop free to process other commands — including `cancel_scan` — while a scan is in progress.
+Every Tauri command that touches the database is `async` and runs its work inside `tauri::async_runtime::spawn_blocking`, moving it onto a dedicated blocking thread. This keeps the Tauri IPC loop permanently free — commands like `cancel_scan` and `list_images` are never blocked waiting for an in-progress scan to release the mutex.
 
 ### Cancellation
 
@@ -148,12 +148,13 @@ All DB writes within a scan are wrapped in a single `BEGIN`/`COMMIT` transaction
 
 1. Any new scan resets the flag to `false` before starting.
 2. `cancel_scan` sets it to `true` from the frontend at any time.
-3. `scan_dir` checks the flag at the top of each file iteration and breaks early if set.
-4. The frontend dismisses the popup immediately on cancel without waiting for the scan to return.
+3. `scan_dir` checks the flag at the start of each file iteration and breaks early if set.
+4. After the loop, any remaining parsed-but-not-yet-written files are flushed to the DB before returning, so no already-parsed work is lost on cancel.
+5. The scan command returns normally with a partial `ScanResult`; the frontend refreshes the table once the command resolves, ensuring the table always reflects what was actually written.
 
 ### Progress throttling
 
-`scan_dir` tracks the last emit time with `std::time::Instant` and skips the `app.emit()` call unless at least 100 ms have elapsed. This prevents flooding WebView2's message queue on large libraries. The frontend shows elapsed time and an estimated ETA based on the processing rate.
+`scan_dir` tracks the last emit time with `std::time::Instant` and skips the `app.emit()` call unless at least 100 ms have elapsed. This prevents flooding WebView2's message queue on large libraries. The frontend shows elapsed time and an ETA smoothed with an exponential moving average (α = 0.3) — the ETA only appears after at least 5 % progress and 2 s elapsed to avoid wild early estimates.
 
 ### Progress popup
 

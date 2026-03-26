@@ -5,12 +5,14 @@ import { DirectoryEntry } from "../types";
 interface Props {
   dirs: DirectoryEntry[];
   onDirsChange: () => void;
+  onImagesChange: () => void;
 }
 
-export function Sidebar({ dirs, onDirsChange }: Props) {
+export function Sidebar({ dirs, onDirsChange, onImagesChange }: Props) {
   async function removeDir(path: string) {
     await invoke("remove_directory", { path });
     onDirsChange();
+    onImagesChange();
   }
 
   return (

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -43,6 +44,15 @@ struct ExistingRecord {
     file_modified_at: Option<String>,
 }
 
+/// Parsed data for a single file, ready to be written to the DB.
+struct ParsedFile {
+    path: PathBuf,
+    file_size: i64,
+    file_modified: Option<String>,
+    meta: ImageMetadata,
+    raw: HashMap<String, String>,
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -66,12 +76,14 @@ pub async fn index_directory(
             if !path.is_dir() {
                 return Err(format!("Not a directory: {dir}"));
             }
-            let conn = conn.lock().map_err(|e| e.to_string())?;
-            conn.execute(
-                "INSERT OR IGNORE INTO scan_directories (path, added_at) VALUES (?1, ?2)",
-                params![dir, Utc::now().to_rfc3339()],
-            )
-            .map_err(|e| e.to_string())?;
+            {
+                let conn = conn.lock().map_err(|e| e.to_string())?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO scan_directories (path, added_at) VALUES (?1, ?2)",
+                    params![dir, Utc::now().to_rfc3339()],
+                )
+                .map_err(|e| e.to_string())?;
+            }
             scan_dir(&dir, &app, &conn, &cancel)
         })();
         is_scanning.store(false, Ordering::Relaxed);
@@ -98,9 +110,8 @@ pub async fn rescan_all(app: AppHandle, state: State<'_, AppState>) -> Result<Sc
     tauri::async_runtime::spawn_blocking(move || {
         is_scanning.store(true, Ordering::Relaxed);
         let result = (|| {
-            let conn = conn.lock().map_err(|e| e.to_string())?;
-
             let dirs: Vec<String> = {
+                let conn = conn.lock().map_err(|e| e.to_string())?;
                 let mut stmt = conn
                     .prepare("SELECT path FROM scan_directories")
                     .map_err(|e| e.to_string())?;
@@ -147,20 +158,26 @@ pub async fn rescan_all(app: AppHandle, state: State<'_, AppState>) -> Result<Sc
 }
 
 // ---------------------------------------------------------------------------
-// Scanner
+// Scanner — releases the mutex between batches so UI stays responsive
 // ---------------------------------------------------------------------------
+
+/// How many files to write in one transaction before releasing the mutex.
+const BATCH: usize = 50;
 
 fn scan_dir(
     dir: &str,
     app: &AppHandle,
-    conn: &Connection,
-    cancel: &std::sync::atomic::AtomicBool,
+    conn: &Arc<Mutex<Connection>>,
+    cancel: &AtomicBool,
 ) -> Result<ScanResult, String> {
     let files = collect_image_files(&PathBuf::from(dir));
     let total = files.len();
 
-    // Pre-fetch existing DB records so skip-checking needs no per-file query.
-    let existing = prefetch_existing(conn)?;
+    // Pre-fetch existing records (brief lock).
+    let existing = {
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        prefetch_existing(&conn)?
+    };
 
     let mut result = ScanResult {
         indexed: 0,
@@ -174,10 +191,11 @@ fn scan_dir(
         .checked_sub(throttle)
         .unwrap_or_else(Instant::now);
 
-    // All DB writes in one transaction for speed (commit every 200 files).
-    const BATCH: usize = 200;
-    conn.execute_batch("BEGIN DEFERRED")
-        .map_err(|e| e.to_string())?;
+    // Process files in batches. Each batch:
+    //   1. Parse headers without holding the lock (only reads file headers, no DB).
+    //   2. Acquire the lock, write the batch in a transaction, release.
+    // This lets UI queries go through between batches.
+    let mut batch_parsed: Vec<ParsedFile> = Vec::with_capacity(BATCH);
 
     for (i, file_path) in files.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -203,9 +221,13 @@ fn scan_dir(
             last_emit = now;
         }
 
-        match process_file(file_path, conn, &existing) {
-            Ok(true) => result.indexed += 1,
-            Ok(false) => result.skipped += 1,
+        // Parse (no lock needed — only reads the file header).
+        match parse_file(file_path, &existing) {
+            Ok(Some(parsed)) => {
+                batch_parsed.push(parsed);
+                result.indexed += 1;
+            }
+            Ok(None) => result.skipped += 1,
             Err(e) => {
                 result.errors += 1;
                 result.error_details
@@ -213,67 +235,91 @@ fn scan_dir(
             }
         }
 
-        // Commit in batches to bound memory.
-        if (i + 1) % BATCH == 0 {
-            if let Err(e) = conn.execute_batch("COMMIT; BEGIN DEFERRED") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(format!("DB batch commit failed: {e}"));
-            }
+        // Flush batch to DB when full.
+        if batch_parsed.len() >= BATCH {
+            let conn = conn.lock().map_err(|e| e.to_string())?;
+            write_batch(&conn, &mut batch_parsed)?;
         }
     }
 
-    // Final commit; rollback on failure so connection stays clean.
-    if let Err(e) = conn.execute_batch("COMMIT") {
-        let _ = conn.execute_batch("ROLLBACK");
-        return Err(format!("DB commit failed: {e}"));
+    // Flush any remaining parsed files (including partial batches after a cancel).
+    if !batch_parsed.is_empty() {
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        write_batch(&conn, &mut batch_parsed)?;
     }
 
-    conn.execute(
-        "UPDATE scan_directories SET last_scanned_at = ?1 WHERE path = ?2",
-        params![Utc::now().to_rfc3339(), dir],
-    )
-    .map_err(|e| e.to_string())?;
+    // Update last_scanned_at.
+    {
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE scan_directories SET last_scanned_at = ?1 WHERE path = ?2",
+            params![Utc::now().to_rfc3339(), dir],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     Ok(result)
 }
 
-// ---------------------------------------------------------------------------
-// Per-file processing
-// ---------------------------------------------------------------------------
-
-/// Returns Ok(true) if indexed, Ok(false) if skipped (unchanged), Err on failure.
-fn process_file(
+/// Parse a file's metadata without touching the DB. Returns None if the file
+/// should be skipped (unchanged).
+fn parse_file(
     path: &Path,
-    conn: &Connection,
     existing: &HashMap<String, ExistingRecord>,
-) -> Result<bool, String> {
+) -> Result<Option<ParsedFile>, String> {
     let (file_size, file_modified) = file_stat(path)?;
-
     let fp = path.to_string_lossy();
 
-    // Fast path: mtime + size match → skip without reading the file at all.
+    // Fast path: mtime + size match → skip.
     if let Some(ex) = existing.get(fp.as_ref()) {
-        let stat_match =
-            ex.file_size == file_size && ex.file_modified_at.as_deref() == file_modified.as_deref();
-
-        if stat_match {
-            return Ok(false);
+        if ex.file_size == file_size
+            && ex.file_modified_at.as_deref() == file_modified.as_deref()
+        {
+            return Ok(None);
         }
-
-        // Stat changed → re-parse metadata (header only, a few KB).
     }
 
-    // New or changed file — parse header and index.
     let ext = extension_lower(path);
-
     let (meta, raw) = match ext.as_str() {
         "fits" | "fit" => fits::parse(path).map_err(|e| e.to_string())?,
         "xisf" => xisf::parse(path).map_err(|e| e.to_string())?,
         _ => return Err(format!("Unsupported extension: {ext}")),
     };
 
-    upsert_and_headers(path, conn, file_size, file_modified, &meta, &raw)?;
-    Ok(true)
+    Ok(Some(ParsedFile {
+        path: path.to_path_buf(),
+        file_size,
+        file_modified,
+        meta,
+        raw,
+    }))
+}
+
+/// Write a batch of parsed files to the DB in a single transaction, then clear
+/// the batch buffer.
+fn write_batch(
+    conn: &Connection,
+    batch: &mut Vec<ParsedFile>,
+) -> Result<(), String> {
+    conn.execute_batch("BEGIN DEFERRED")
+        .map_err(|e| e.to_string())?;
+
+    for pf in batch.iter() {
+        if let Err(e) = upsert_and_headers(
+            &pf.path, conn, pf.file_size, pf.file_modified.clone(), &pf.meta, &pf.raw,
+        ) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+
+    if let Err(e) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(format!("DB commit failed: {e}"));
+    }
+
+    batch.clear();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -469,4 +515,3 @@ fn upsert_and_headers(
 
     Ok(())
 }
-

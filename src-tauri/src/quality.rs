@@ -194,33 +194,40 @@ pub struct QualityUpdate {
 
 /// Spawn a background thread that continuously processes light frames with
 /// missing FWHM/star_count data. Pauses while a scan is in progress.
+/// Uses `try_lock` everywhere so it never blocks the UI's DB access.
 pub fn spawn_backfill_worker(
     conn: Arc<Mutex<rusqlite::Connection>>,
     is_scanning: Arc<AtomicBool>,
     app: AppHandle,
 ) {
     thread::spawn(move || {
-        // Small initial delay to let the app finish starting up.
-        thread::sleep(Duration::from_secs(2));
+        // Wait for the app to fully start and first scan to finish.
+        thread::sleep(Duration::from_secs(5));
 
         loop {
             // Pause while a scan is running.
             if is_scanning.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_secs(1));
                 continue;
             }
 
             // Fetch the next light frame that needs quality analysis.
-            let next = {
-                let Ok(conn) = conn.lock() else { break };
-                conn.query_row(
-                    "SELECT file_path FROM images \
-                     WHERE LOWER(image_type) = 'light' AND fwhm IS NULL \
-                     LIMIT 1",
-                    [],
-                    |r| r.get::<_, String>(0),
-                )
-                .ok()
+            // Use try_lock so we never block UI queries.
+            let next = match conn.try_lock() {
+                Ok(conn) => conn
+                    .query_row(
+                        "SELECT file_path FROM images \
+                         WHERE LOWER(image_type) = 'light' AND fwhm IS NULL \
+                         LIMIT 1",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .ok(),
+                Err(_) => {
+                    // Mutex busy (scan or UI query) — back off.
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
             };
 
             let Some(file_path) = next else {
@@ -255,9 +262,8 @@ pub fn spawn_backfill_worker(
                 Err(_) => (None, None),
             };
 
-            // Brief lock to write results.
-            {
-                let Ok(conn) = conn.lock() else { break };
+            // Brief try_lock to write results — skip if mutex is busy.
+            if let Ok(conn) = conn.try_lock() {
                 // Write actual values, or 0-sentinel for fwhm so we don't retry failures.
                 let db_fwhm = fwhm.or(Some(0.0));
                 let _ = conn.execute(
@@ -278,8 +284,8 @@ pub fn spawn_backfill_worker(
                 );
             }
 
-            // Small pause between files to avoid saturating the CPU / disk.
-            thread::sleep(Duration::from_millis(100));
+            // Pause between files to avoid saturating the CPU / disk.
+            thread::sleep(Duration::from_millis(200));
         }
     });
 }

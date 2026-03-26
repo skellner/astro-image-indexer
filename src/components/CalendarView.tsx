@@ -17,6 +17,33 @@ function toDateKey(dateObs: string): string {
   return dateObs.slice(0, 10); // "YYYY-MM-DD"
 }
 
+/**
+ * Compute the moon phase for a given date.
+ * Returns a value 0–7 mapping to the 8 principal phases.
+ * Based on the synodic month (~29.53 days) with a known new moon reference.
+ */
+function moonPhase(year: number, month: number, day: number): number {
+  // Reference new moon: 2000-01-06 18:14 UTC (Julian day 2451550.26)
+  const jd =
+    367 * year -
+    Math.floor(7 * (year + Math.floor((month + 9) / 12)) / 4) +
+    Math.floor(275 * month / 9) +
+    day +
+    1721013.5;
+  const daysSinceNew = jd - 2451550.26;
+  const synodicMonth = 29.53058867;
+  const phase = ((daysSinceNew % synodicMonth) + synodicMonth) % synodicMonth;
+  // 0=new, 1=waxing crescent, 2=first quarter, 3=waxing gibbous,
+  // 4=full, 5=waning gibbous, 6=last quarter, 7=waning crescent
+  return Math.floor((phase / synodicMonth) * 8) % 8;
+}
+
+const MOON_ICONS = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+const MOON_LABELS = [
+  "New Moon", "Waxing Crescent", "First Quarter", "Waxing Gibbous",
+  "Full Moon", "Waning Gibbous", "Last Quarter", "Waning Crescent",
+];
+
 /** Format total seconds as e.g. "1h 23m" or "45m" or "30s". */
 function formatExposure(seconds: number): string {
   if (seconds >= 3600) {
@@ -124,6 +151,7 @@ export function CalendarView({ images }: Props) {
             : null;
           const entry = dateKey ? dayMap.get(dateKey) : undefined;
           const isToday = dateKey === todayKey;
+          const phase = isInMonth ? moonPhase(year, month + 1, dayNum) : 0;
 
           return (
             <div
@@ -132,16 +160,26 @@ export function CalendarView({ images }: Props) {
                 !isInMonth ? "opacity-20" : ""
               }`}
             >
-              {/* Day number */}
-              <span
-                className={`text-xs font-medium self-start leading-none mb-1 w-5 h-5 flex items-center justify-center rounded-full ${
-                  isToday
-                    ? "bg-blue-600 text-white"
-                    : "text-gray-500"
-                }`}
-              >
-                {isInMonth ? dayNum : ""}
-              </span>
+              {/* Day number + moon phase */}
+              <div className="flex items-center justify-between mb-1">
+                <span
+                  className={`text-xs font-medium leading-none w-5 h-5 flex items-center justify-center rounded-full ${
+                    isToday
+                      ? "bg-blue-600 text-white"
+                      : "text-gray-500"
+                  }`}
+                >
+                  {isInMonth ? dayNum : ""}
+                </span>
+                {isInMonth && (
+                  <span
+                    className="text-[20px] leading-none opacity-50"
+                    title={MOON_LABELS[phase]}
+                  >
+                    {MOON_ICONS[phase]}
+                  </span>
+                )}
+              </div>
 
               {/* Objects */}
               {entry && (

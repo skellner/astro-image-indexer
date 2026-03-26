@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { CalendarView } from "./components/CalendarView";
@@ -34,6 +34,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [lastResult, setLastResult] = useState<ScanResult | null>(null);
+  const cancelledRef = useRef(false);
 
   const refreshDirs = useCallback(async () => {
     const [d, s, f, o] = await Promise.all([
@@ -49,13 +50,31 @@ export default function App() {
   }, []);
 
   const refreshImages = useCallback(async () => {
-    const rows = await invoke<ImageRow[]>("list_images", {
-      search: search || null,
-      imageType: imageType || null,
-      filterName: filterName || null,
-      objectName: objectName || null,
-    });
-    setImages(rows);
+    try {
+      const rows = await invoke<ImageRow[]>("list_images", {
+        search: search || null,
+        imageType: imageType || null,
+        filterName: filterName || null,
+        objectName: objectName || null,
+      });
+      setImages(rows);
+    } catch (e) {
+      console.error("list_images failed:", e);
+      // Retry once after a short delay in case of transient mutex contention.
+      setTimeout(async () => {
+        try {
+          const rows = await invoke<ImageRow[]>("list_images", {
+            search: search || null,
+            imageType: imageType || null,
+            filterName: filterName || null,
+            objectName: objectName || null,
+          });
+          setImages(rows);
+        } catch (e2) {
+          console.error("list_images retry failed:", e2);
+        }
+      }, 500);
+    }
   }, [search, imageType, filterName, objectName]);
 
   useEffect(() => { refreshDirs(); }, [refreshDirs]);
@@ -87,7 +106,16 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
+  // Derive background quality progress from loaded images.
+  const qualityProgress = useMemo(() => {
+    const lights = images.filter((img) => img.image_type === "Light");
+    if (lights.length === 0) return null;
+    const done = lights.filter((img) => img.fwhm != null && img.fwhm > 0).length;
+    return { done, total: lights.length };
+  }, [images]);
+
   function handleScanStart() {
+    cancelledRef.current = false;
     setScanning(true);
     setProgress(null);
     setLastResult(null);
@@ -96,16 +124,23 @@ export default function App() {
   function handleScanEnd(result: ScanResult) {
     setScanning(false);
     setProgress(null);
-    setLastResult(result);
+    // Show the summary only if the user didn't cancel.
+    if (!cancelledRef.current) {
+      setLastResult(result);
+    }
+    // Always refresh to show whatever was indexed (full scan or partial).
     refreshImages();
     refreshDirs();
   }
 
   async function handleCancel() {
+    cancelledRef.current = true;
     await invoke("cancel_scan");
     setScanning(false);
     setProgress(null);
     setLastResult(null);
+    // Don't refresh here — handleScanEnd will be called once the Rust command
+    // finishes its last batch write and returns, giving us consistent data.
   }
 
   return (
@@ -121,12 +156,13 @@ export default function App() {
         stats={stats}
         dirs={dirs}
         scanning={scanning}
+        qualityProgress={qualityProgress}
         onDirsChange={refreshDirs}
         onScanStart={handleScanStart}
         onScanEnd={handleScanEnd}
       />
       <div className="flex flex-1 min-h-0">
-        <Sidebar dirs={dirs} onDirsChange={refreshDirs} />
+        <Sidebar dirs={dirs} onDirsChange={refreshDirs} onImagesChange={refreshImages} />
         <div className="flex flex-col flex-1 min-w-0">
           {/* Tab bar */}
           <div className="flex items-center border-b border-gray-800 px-4 gap-1 pt-1">

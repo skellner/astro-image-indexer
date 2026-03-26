@@ -6,12 +6,13 @@ interface Props {
   stats: LibraryStats | null;
   dirs: DirectoryEntry[];
   scanning: boolean;
+  qualityProgress: { done: number; total: number } | null;
   onDirsChange: () => void;
   onScanStart: () => void;
   onScanEnd: (r: ScanResult) => void;
 }
 
-export function TopBar({ stats, dirs, scanning, onDirsChange, onScanStart, onScanEnd }: Props) {
+export function TopBar({ stats, dirs, scanning, qualityProgress, onDirsChange, onScanStart, onScanEnd }: Props) {
   async function addDirectory() {
     const selected = await open({ directory: true, multiple: false });
     if (!selected) return;
@@ -38,10 +39,25 @@ export function TopBar({ stats, dirs, scanning, onDirsChange, onScanStart, onSca
 
   return (
     <header className="flex items-center gap-6 px-4 h-14 shrink-0 bg-gray-900 border-b border-gray-700">
-      {/* Title */}
+      {/* Title + quality progress */}
       <div className="shrink-0">
-        <span className="text-sm font-semibold text-white tracking-wide">AstroIndex</span>
-        <span className="text-xs text-gray-500 ml-2">FITS &amp; XISF</span>
+        <div>
+          <span className="text-sm font-semibold text-white tracking-wide">AstroIndex</span>
+          <span className="text-xs text-gray-500 ml-2">FITS &amp; XISF</span>
+        </div>
+        {qualityProgress && qualityProgress.total > 0 && qualityProgress.done < qualityProgress.total && (
+          <div className="flex items-center gap-2 mt-1">
+            <div className="w-24 h-1.5 bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 rounded-full transition-all duration-300"
+                style={{ width: `${Math.round((qualityProgress.done / qualityProgress.total) * 100)}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-gray-500">
+              {qualityProgress.done}/{qualityProgress.total} stars
+            </span>
+          </div>
+        )}
       </div>
 
       <div className="w-px h-6 bg-gray-700 shrink-0" />

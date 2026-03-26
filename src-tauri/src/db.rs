@@ -12,6 +12,9 @@ pub enum DbError {
 
 pub fn open(db_path: &Path) -> Result<Connection, DbError> {
     let conn = Connection::open(db_path)?;
+    // Set a short busy timeout so the app doesn't hang if a zombie process
+    // holds the DB lock — it will return SQLITE_BUSY instead of blocking.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     migrate(&conn)?;
     Ok(conn)

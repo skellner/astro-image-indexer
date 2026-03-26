@@ -24,16 +24,19 @@ function formatDuration(seconds: number): string {
 export function ScanProgressBar({ scanning, progress, lastResult, onDismiss, onCancel }: Props) {
   const startTimeRef = useRef<number | null>(null);
   const finalElapsedRef = useRef<number>(0);
+  const smoothEtaRef = useRef<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
   // Record start time when scan begins; freeze elapsed when it ends
   useEffect(() => {
     if (scanning && startTimeRef.current === null) {
       startTimeRef.current = Date.now();
+      smoothEtaRef.current = null;
     }
     if (!scanning && startTimeRef.current !== null) {
       finalElapsedRef.current = (Date.now() - startTimeRef.current) / 1000;
       startTimeRef.current = null;
+      smoothEtaRef.current = null;
     }
   }, [scanning]);
 
@@ -48,12 +51,24 @@ export function ScanProgressBar({ scanning, progress, lastResult, onDismiss, onC
 
   const pct = progress ? Math.round((progress.current / progress.total) * 100) : 0;
 
+  // `now` triggers re-renders every second; we use Date.now() inline for precision.
+  void now;
   const elapsedSec = scanning && startTimeRef.current
-    ? (now - startTimeRef.current) / 1000
+    ? (Date.now() - startTimeRef.current) / 1000
     : finalElapsedRef.current;
-  const etaSec = (progress && progress.current > 0)
-    ? (elapsedSec / progress.current) * (progress.total - progress.current)
-    : null;
+
+  // ETA: only show after 10% progress and at least 2 seconds elapsed to avoid wild early estimates.
+  // Smooth with exponential moving average (α=0.3) to prevent flickering.
+  let etaSec: number | null = null;
+  if (progress && progress.current > 0 && elapsedSec >= 2 && progress.current >= progress.total * 0.05) {
+    const rawEta = (elapsedSec / progress.current) * (progress.total - progress.current);
+    if (smoothEtaRef.current === null) {
+      smoothEtaRef.current = rawEta;
+    } else {
+      smoothEtaRef.current = 0.3 * rawEta + 0.7 * smoothEtaRef.current;
+    }
+    etaSec = smoothEtaRef.current;
+  }
 
   const modal = (
     <div style={{
