@@ -20,6 +20,7 @@ export default function App() {
   const [dirs, setDirs] = useState<DirectoryEntry[]>([]);
   const [stats, setStats] = useState<LibraryStats | null>(null);
   const [images, setImages] = useState<ImageRow[]>([]);
+  const [allImages, setAllImages] = useState<ImageRow[]>([]);
   const [filterOptions, setFilterOptions] = useState<string[]>([]);
   const [objectOptions, setObjectOptions] = useState<string[]>([]);
   const [selected, setSelected] = useState<ImageRow | null>(null);
@@ -51,25 +52,33 @@ export default function App() {
 
   const refreshImages = useCallback(async () => {
     try {
-      const rows = await invoke<ImageRow[]>("list_images", {
-        search: search || null,
-        imageType: imageType || null,
-        filterName: filterName || null,
-        objectName: objectName || null,
-      });
-      setImages(rows);
+      const [filtered, all] = await Promise.all([
+        invoke<ImageRow[]>("list_images", {
+          search: search || null,
+          imageType: imageType || null,
+          filterName: filterName || null,
+          objectName: objectName || null,
+        }),
+        invoke<ImageRow[]>("list_images", {}),
+      ]);
+      setImages(filtered);
+      setAllImages(all);
     } catch (e) {
       console.error("list_images failed:", e);
       // Retry once after a short delay in case of transient mutex contention.
       setTimeout(async () => {
         try {
-          const rows = await invoke<ImageRow[]>("list_images", {
-            search: search || null,
-            imageType: imageType || null,
-            filterName: filterName || null,
-            objectName: objectName || null,
-          });
-          setImages(rows);
+          const [filtered, all] = await Promise.all([
+            invoke<ImageRow[]>("list_images", {
+              search: search || null,
+              imageType: imageType || null,
+              filterName: filterName || null,
+              objectName: objectName || null,
+            }),
+            invoke<ImageRow[]>("list_images", {}),
+          ]);
+          setImages(filtered);
+          setAllImages(all);
         } catch (e2) {
           console.error("list_images retry failed:", e2);
         }
@@ -108,6 +117,11 @@ export default function App() {
       (e) => {
         const { file_path, fwhm, star_count } = e.payload;
         setImages((prev) =>
+          prev.map((img) =>
+            img.file_path === file_path ? { ...img, fwhm, star_count } : img
+          )
+        );
+        setAllImages((prev) =>
           prev.map((img) =>
             img.file_path === file_path ? { ...img, fwhm, star_count } : img
           )
@@ -243,7 +257,7 @@ export default function App() {
           )}
 
           {activeView === "calendar" && (
-            <CalendarView images={images} />
+            <CalendarView images={allImages} />
           )}
         </div>
       </div>
