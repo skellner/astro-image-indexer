@@ -427,6 +427,35 @@ pub async fn get_object_options(state: State<'_, AppState>) -> Result<Vec<String
 }
 
 // ---------------------------------------------------------------------------
+// Quality progress (independent of filters)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct QualityProgress {
+    pub done: i64,
+    pub total: i64,
+}
+
+#[tauri::command]
+pub async fn get_quality_progress(state: State<'_, AppState>) -> Result<QualityProgress, String> {
+    let conn = state.conn.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT COUNT(*),
+                    COUNT(CASE WHEN fwhm IS NOT NULL AND fwhm > 0 THEN 1 END)
+             FROM images WHERE LOWER(image_type) = 'light'",
+            [],
+            |r| Ok(QualityProgress { total: r.get(0)?, done: r.get(1)? }),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
 // On-demand quality analysis
 // ---------------------------------------------------------------------------
 

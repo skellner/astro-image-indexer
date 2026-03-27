@@ -110,6 +110,7 @@ pub fn run() {
             queries::get_filter_options,
             queries::get_object_options,
             queries::compute_quality,
+            queries::get_quality_progress,
             preview::get_image_preview,
             open_file,
             reveal_in_folder,

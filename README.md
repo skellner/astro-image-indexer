@@ -110,7 +110,9 @@ User action → invoke("command_name", args) → Rust handler → serialized str
 | `get_image_detail` | `id: number` | `ImageDetail` | async; runs on blocking thread |
 | `get_image_preview` | `file_path: string` | `string` (data URL) | async; returns base64 PNG |
 | `compute_quality` | `file_path: string` | `QualityResult` | async; computes FWHM + star count on demand |
+| `get_quality_progress` | — | `QualityProgress` | async; returns `{ done, total }` light frame quality counts |
 | `open_file` | `path: string` | `void` | opens file with its default Windows application |
+| `reveal_in_folder` | `path: string` | `void` | opens Explorer with the file selected |
 | `get_object_options` | — | `string[]` | async; runs on blocking thread |
 | `list_directories` | — | `DirectoryEntry[]` | async; runs on blocking thread |
 | `remove_directory` | `path: string` | `void` | async; runs on blocking thread |

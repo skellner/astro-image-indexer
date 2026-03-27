@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { CalendarView } from "./components/CalendarView";
@@ -87,6 +87,20 @@ export default function App() {
     return () => { unlisten.then((f) => f()); };
   }, []);
 
+  // Quality progress — fetched independently of filtered images.
+  const [qualityProgress, setQualityProgress] = useState<{ done: number; total: number } | null>(null);
+
+  const refreshQualityProgress = useCallback(async () => {
+    try {
+      const p = await invoke<{ done: number; total: number }>("get_quality_progress");
+      setQualityProgress(p.total > 0 ? p : null);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => { refreshQualityProgress(); }, [refreshQualityProgress]);
+
   // Listen for background quality updates and patch the images array in-place.
   useEffect(() => {
     const unlisten = listen<{ file_path: string; fwhm: number | null; star_count: number | null }>(
@@ -101,18 +115,14 @@ export default function App() {
         setSelected((prev) =>
           prev && prev.file_path === file_path ? { ...prev, fwhm, star_count } : prev
         );
+        // Increment quality progress locally.
+        setQualityProgress((prev) =>
+          prev ? { ...prev, done: Math.min(prev.done + 1, prev.total) } : prev
+        );
       },
     );
     return () => { unlisten.then((f) => f()); };
   }, []);
-
-  // Derive background quality progress from loaded images.
-  const qualityProgress = useMemo(() => {
-    const lights = images.filter((img) => img.image_type === "Light");
-    if (lights.length === 0) return null;
-    const done = lights.filter((img) => img.fwhm != null && img.fwhm > 0).length;
-    return { done, total: lights.length };
-  }, [images]);
 
   function handleScanStart() {
     cancelledRef.current = false;
@@ -131,6 +141,7 @@ export default function App() {
     // Always refresh to show whatever was indexed (full scan or partial).
     refreshImages();
     refreshDirs();
+    refreshQualityProgress();
   }
 
   async function handleCancel() {
@@ -139,8 +150,13 @@ export default function App() {
     setScanning(false);
     setProgress(null);
     setLastResult(null);
-    // Don't refresh here — handleScanEnd will be called once the Rust command
-    // finishes its last batch write and returns, giving us consistent data.
+    // Also refresh here — handleScanEnd will fire too when the Rust command
+    // returns, but an extra refresh ensures partial results appear promptly.
+    setTimeout(() => {
+      refreshImages();
+      refreshDirs();
+      refreshQualityProgress();
+    }, 500);
   }
 
   return (
