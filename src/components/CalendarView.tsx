@@ -3,7 +3,7 @@ import { ImageRow } from "../types";
 
 interface Props {
   images: ImageRow[];
-  onSelectDate?: (date: string) => void;
+  onSelectObject?: (objectName: string) => void;
 }
 
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
@@ -57,7 +57,7 @@ function formatExposure(seconds: number): string {
   return `${Math.round(seconds)}s`;
 }
 
-export function CalendarView({ images }: Props) {
+export function CalendarView({ images, onSelectObject }: Props) {
   // Default to the month of the most recent image, or current month.
   const defaultMonth = useMemo(() => {
     const dates = images
@@ -195,7 +195,10 @@ export function CalendarView({ images }: Props) {
                   {Array.from(entry.objects).slice(0, 3).map((obj) => (
                     <span
                       key={obj}
-                      className="text-[11px] leading-tight bg-blue-900/50 text-blue-300 rounded px-1 py-0.5 truncate"
+                      onClick={() => onSelectObject?.(obj)}
+                      className={`text-[11px] leading-tight bg-blue-900/50 text-blue-300 rounded px-1 py-0.5 truncate ${
+                        onSelectObject ? "cursor-pointer hover:bg-blue-800/60 hover:text-blue-200 transition-colors" : ""
+                      }`}
                       title={obj}
                     >
                       {obj}

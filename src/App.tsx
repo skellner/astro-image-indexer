@@ -257,7 +257,13 @@ export default function App() {
           )}
 
           {activeView === "calendar" && (
-            <CalendarView images={allImages} />
+            <CalendarView
+              images={allImages}
+              onSelectObject={(obj) => {
+                setObjectName(obj);
+                setActiveView("table");
+              }}
+            />
           )}
         </div>
       </div>
