@@ -463,6 +463,7 @@ pub async fn get_quality_progress(state: State<'_, AppState>) -> Result<QualityP
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QualityResult {
     pub fwhm: Option<f64>,
+    pub eccentricity: Option<f64>,
     pub star_count: Option<i64>,
 }
 
@@ -488,23 +489,23 @@ pub async fn compute_quality(
             _ => preview::load_xisf_pixels(path),
         };
 
-        let (fwhm, star_count) = match pixel_result {
+        let (fwhm, eccentricity, star_count) = match pixel_result {
             Ok(buf) => match quality::analyse_stars(&buf) {
-                Some((f, c)) => (Some(f), Some(c as i64)),
-                None => (None, None),
+                Some((f, e, c)) => (Some(f), Some(e), Some(c as i64)),
+                None => (None, None, None),
             },
-            Err(_) => (None, None),
+            Err(_) => (None, None, None),
         };
 
         // Write results to DB (short lock, just a single UPDATE).
         let conn = conn.lock().map_err(|e| e.to_string())?;
         conn.execute(
-            "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
-            params![fwhm, star_count, file_path],
+            "UPDATE images SET fwhm = ?1, eccentricity = ?2, star_count = ?3 WHERE file_path = ?4",
+            params![fwhm, eccentricity, star_count, file_path],
         )
         .map_err(|e| e.to_string())?;
 
-        Ok(QualityResult { fwhm, star_count })
+        Ok(QualityResult { fwhm, eccentricity, star_count })
     })
     .await
     .map_err(|e| e.to_string())?

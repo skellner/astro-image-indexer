@@ -112,22 +112,22 @@ export default function App() {
 
   // Listen for background quality updates and patch the images array in-place.
   useEffect(() => {
-    const unlisten = listen<{ file_path: string; fwhm: number | null; star_count: number | null }>(
+    const unlisten = listen<{ file_path: string; fwhm: number | null; eccentricity: number | null; star_count: number | null }>(
       "quality://update",
       (e) => {
-        const { file_path, fwhm, star_count } = e.payload;
+        const { file_path, fwhm, eccentricity, star_count } = e.payload;
         setImages((prev) =>
           prev.map((img) =>
-            img.file_path === file_path ? { ...img, fwhm, star_count } : img
+            img.file_path === file_path ? { ...img, fwhm, eccentricity, star_count } : img
           )
         );
         setAllImages((prev) =>
           prev.map((img) =>
-            img.file_path === file_path ? { ...img, fwhm, star_count } : img
+            img.file_path === file_path ? { ...img, fwhm, eccentricity, star_count } : img
           )
         );
         setSelected((prev) =>
-          prev && prev.file_path === file_path ? { ...prev, fwhm, star_count } : prev
+          prev && prev.file_path === file_path ? { ...prev, fwhm, eccentricity, star_count } : prev
         );
         // Increment quality progress locally.
         setQualityProgress((prev) =>
@@ -240,14 +240,14 @@ export default function App() {
                   <DetailPanel
                     image={selected}
                     onClose={() => setSelected(null)}
-                    onQualityComputed={(id, fwhm, starCount) => {
+                    onQualityComputed={(id, fwhm, eccentricity, starCount) => {
                       setImages((prev) =>
                         prev.map((img) =>
-                          img.id === id ? { ...img, fwhm, star_count: starCount } : img
+                          img.id === id ? { ...img, fwhm, eccentricity, star_count: starCount } : img
                         )
                       );
                       setSelected((prev) =>
-                        prev && prev.id === id ? { ...prev, fwhm, star_count: starCount } : prev
+                        prev && prev.id === id ? { ...prev, fwhm, eccentricity, star_count: starCount } : prev
                       );
                     }}
                   />

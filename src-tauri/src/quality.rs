@@ -23,10 +23,9 @@ const MARGIN: usize = 12;
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Measure star count and median FWHM (in pixels) from a pixel buffer.
-/// Returns None if no valid stars are found (e.g. the image is not a light frame
-/// or has too few stars to measure).
-pub fn analyse_stars(buf: &PixelBuffer) -> Option<(f64, i64)> {
+/// Measure star count, median FWHM (pixels), and median eccentricity from a pixel buffer.
+/// Returns `None` if no valid stars are found.
+pub fn analyse_stars(buf: &PixelBuffer) -> Option<(f64, f64, i64)> {
     let (crop, cw, ch) = extract_crop(buf);
     let (background, sigma) = estimate_background(&crop);
 
@@ -43,21 +42,33 @@ pub fn analyse_stars(buf: &PixelBuffer) -> Option<(f64, i64)> {
         return None;
     }
 
-    let mut fwhm_values: Vec<f32> = peaks
+    // Collect (fwhm, eccentricity) pairs for every valid star.
+    let mut measurements: Vec<(f32, f32)> = peaks
         .iter()
-        .filter_map(|&(x, y)| measure_fwhm(&crop, cw, ch, x, y, background))
-        .filter(|&f| f >= 1.5 && f <= 25.0)
+        .filter_map(|&(x, y)| {
+            let fwhm = measure_fwhm(&crop, cw, ch, x, y, background)?;
+            if !(1.5..=25.0).contains(&fwhm) {
+                return None;
+            }
+            let ecc = measure_eccentricity(&crop, cw, ch, x, y, background).unwrap_or(0.0);
+            Some((fwhm, ecc))
+        })
         .collect();
 
-    if fwhm_values.is_empty() {
+    if measurements.is_empty() {
         return None;
     }
 
-    fwhm_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median_fwhm = fwhm_values[fwhm_values.len() / 2] as f64;
-    let star_count = fwhm_values.len() as i64;
+    let n = measurements.len();
 
-    Some((median_fwhm, star_count))
+    measurements.sort_unstable_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_fwhm = measurements[n / 2].0 as f64;
+
+    let mut ecc_values: Vec<f32> = measurements.iter().map(|(_, e)| *e).collect();
+    ecc_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median_ecc = ecc_values[n / 2] as f64;
+
+    Some((median_fwhm, median_ecc, n as i64))
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +193,89 @@ fn measure_fwhm(
 }
 
 // ---------------------------------------------------------------------------
+// Eccentricity measurement for a single star
+// ---------------------------------------------------------------------------
+
+/// Compute eccentricity via intensity-weighted second-order central moments.
+///
+/// The 2×2 covariance matrix of the star's light distribution has eigenvalues
+/// λ_max ≥ λ_min.  The semi-axes are proportional to √λ, so:
+///
+///   eccentricity = √(1 − λ_min / λ_max)
+///
+/// Returns 0 for a perfectly round star and approaches 1 for a line.
+fn measure_eccentricity(
+    pixels: &[f32],
+    width: usize,
+    height: usize,
+    cx: usize,
+    cy: usize,
+    background: f32,
+) -> Option<f32> {
+    let v_peak = pixels[cy * width + cx];
+    let v_thresh = background + (v_peak - background) * 0.5;
+    if v_thresh <= background {
+        return None;
+    }
+
+    let radius: usize = 12;
+    let x0 = cx.saturating_sub(radius);
+    let x1 = (cx + radius + 1).min(width);
+    let y0 = cy.saturating_sub(radius);
+    let y1 = (cy + radius + 1).min(height);
+
+    // Pass 1: intensity-weighted centroid (more accurate than the raw peak).
+    let mut sum_w = 0.0f64;
+    let mut sum_wx = 0.0f64;
+    let mut sum_wy = 0.0f64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let v = pixels[y * width + x] as f64;
+            if v < v_thresh as f64 { continue; }
+            let w = v - background as f64;
+            sum_w  += w;
+            sum_wx += w * x as f64;
+            sum_wy += w * y as f64;
+        }
+    }
+    if sum_w <= 0.0 { return None; }
+    let cx_f = sum_wx / sum_w;
+    let cy_f = sum_wy / sum_w;
+
+    // Pass 2: intensity-weighted second-order central moments.
+    let mut mu_xx = 0.0f64;
+    let mut mu_yy = 0.0f64;
+    let mut mu_xy = 0.0f64;
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let v = pixels[y * width + x] as f64;
+            if v < v_thresh as f64 { continue; }
+            let w  = v - background as f64;
+            let dx = x as f64 - cx_f;
+            let dy = y as f64 - cy_f;
+            mu_xx += w * dx * dx;
+            mu_yy += w * dy * dy;
+            mu_xy += w * dx * dy;
+        }
+    }
+    mu_xx /= sum_w;
+    mu_yy /= sum_w;
+    mu_xy /= sum_w;
+
+    // Eigenvalues of the covariance matrix [[mu_xx, mu_xy], [mu_xy, mu_yy]].
+    let trace = mu_xx + mu_yy;
+    let det   = mu_xx * mu_yy - mu_xy * mu_xy;
+    let disc  = ((trace * trace) / 4.0 - det).max(0.0);
+    let lambda_max = trace / 2.0 + disc.sqrt();
+    let lambda_min = trace / 2.0 - disc.sqrt();
+
+    if lambda_max <= 0.0 || lambda_min < 0.0 { return None; }
+
+    let ecc = (1.0 - lambda_min / lambda_max).sqrt() as f32;
+    if ecc.is_finite() && (0.0..=1.0).contains(&ecc) { Some(ecc) } else { None }
+}
+
+// ---------------------------------------------------------------------------
 // Background quality backfill worker
 // ---------------------------------------------------------------------------
 
@@ -189,6 +283,7 @@ fn measure_fwhm(
 pub struct QualityUpdate {
     pub file_path: String,
     pub fwhm: Option<f64>,
+    pub eccentricity: Option<f64>,
     pub star_count: Option<i64>,
 }
 
@@ -254,12 +349,12 @@ pub fn spawn_backfill_worker(
                 _ => preview::load_xisf_pixels(path),
             };
 
-            let (fwhm, star_count) = match pixel_result {
+            let (fwhm, eccentricity, star_count) = match pixel_result {
                 Ok(buf) => match analyse_stars(&buf) {
-                    Some((f, c)) => (Some(f), Some(c)),
-                    None => (None, None),
+                    Some((f, e, c)) => (Some(f), Some(e), Some(c)),
+                    None => (None, None, None),
                 },
-                Err(_) => (None, None),
+                Err(_) => (None, None, None),
             };
 
             // Brief try_lock to write results — skip if mutex is busy.
@@ -267,8 +362,8 @@ pub fn spawn_backfill_worker(
                 // Write actual values, or 0-sentinel for fwhm so we don't retry failures.
                 let db_fwhm = fwhm.or(Some(0.0));
                 let _ = conn.execute(
-                    "UPDATE images SET fwhm = ?1, star_count = ?2 WHERE file_path = ?3",
-                    params![db_fwhm, star_count, file_path],
+                    "UPDATE images SET fwhm = ?1, eccentricity = ?2, star_count = ?3 WHERE file_path = ?4",
+                    params![db_fwhm, eccentricity, star_count, file_path],
                 );
             }
 
@@ -279,6 +374,7 @@ pub fn spawn_backfill_worker(
                     QualityUpdate {
                         file_path,
                         fwhm,
+                        eccentricity,
                         star_count,
                     },
                 );

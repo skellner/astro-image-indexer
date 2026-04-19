@@ -10,7 +10,7 @@ interface Props {
 
 type SortKey = keyof Pick<
   ImageRow,
-  "file_name" | "object_name" | "image_type" | "filter_name" | "exposure_time" | "date_obs" | "instrument" | "fwhm" | "star_count"
+  "file_name" | "object_name" | "image_type" | "filter_name" | "exposure_time" | "date_obs" | "instrument" | "fwhm" | "eccentricity" | "star_count"
 >;
 
 export function ImageTable({ images, onSelect, selectedId }: Props) {
@@ -67,6 +67,7 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
               Temp
             </th>
             <Th label="FWHM" sortKey="fwhm" current={sortKey} asc={sortAsc} onSort={toggleSort} />
+            <Th label="Ecc" sortKey="eccentricity" current={sortKey} asc={sortAsc} onSort={toggleSort} />
             <Th label="Stars" sortKey="star_count" current={sortKey} asc={sortAsc} onSort={toggleSort} />
           </tr>
         </thead>
@@ -110,7 +111,10 @@ export function ImageTable({ images, onSelect, selectedId }: Props) {
                 {img.ccd_temp != null ? `${img.ccd_temp.toFixed(1)}°C` : "—"}
               </td>
               <td className="px-3 py-2 text-gray-300 text-xs whitespace-nowrap">
-                {img.fwhm != null ? `${img.fwhm.toFixed(2)}"` : "—"}
+                {img.fwhm != null ? `${img.fwhm.toFixed(2)} px` : "—"}
+              </td>
+              <td className="px-3 py-2 text-gray-300 text-xs whitespace-nowrap">
+                {img.eccentricity != null ? img.eccentricity.toFixed(3) : "—"}
               </td>
               <td className="px-3 py-2 text-gray-300 text-xs whitespace-nowrap text-right">
                 {img.star_count != null ? img.star_count.toLocaleString() : "—"}

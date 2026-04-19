@@ -5,7 +5,7 @@ import { ImageDetail, ImageRow } from "../types";
 interface Props {
   image: ImageRow;
   onClose: () => void;
-  onQualityComputed?: (id: number, fwhm: number | null, starCount: number | null) => void;
+  onQualityComputed?: (id: number, fwhm: number | null, eccentricity: number | null, starCount: number | null) => void;
 }
 
 export function DetailPanel({ image, onClose, onQualityComputed }: Props) {
@@ -15,12 +15,14 @@ export function DetailPanel({ image, onClose, onQualityComputed }: Props) {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [qualityFwhm, setQualityFwhm] = useState<number | null>(null);
+  const [qualityEcc, setQualityEcc] = useState<number | null>(null);
   const [qualityStars, setQualityStars] = useState<number | null>(null);
   const [qualityLoading, setQualityLoading] = useState(false);
 
   useEffect(() => {
     setDetail(null);
     setQualityFwhm(null);
+    setQualityEcc(null);
     setQualityStars(null);
     invoke<{ row: ImageRow } & Omit<ImageDetail, keyof ImageRow>>("get_image_detail", { id: image.id })
       .then((d) => setDetail(d as unknown as ImageDetail))
@@ -32,16 +34,18 @@ export function DetailPanel({ image, onClose, onQualityComputed }: Props) {
     if (image.image_type !== "Light") return;
     if (image.fwhm != null) {
       setQualityFwhm(image.fwhm);
+      setQualityEcc(image.eccentricity ?? null);
       setQualityStars(image.star_count ?? null);
       return;
     }
     setQualityLoading(true);
-    invoke<{ fwhm: number | null; star_count: number | null }>("compute_quality", { filePath: image.file_path })
+    invoke<{ fwhm: number | null; eccentricity: number | null; star_count: number | null }>("compute_quality", { filePath: image.file_path })
       .then((r) => {
         setQualityFwhm(r.fwhm);
+        setQualityEcc(r.eccentricity);
         setQualityStars(r.star_count);
         setQualityLoading(false);
-        onQualityComputed?.(image.id, r.fwhm, r.star_count);
+        onQualityComputed?.(image.id, r.fwhm, r.eccentricity, r.star_count);
       })
       .catch(() => setQualityLoading(false));
   }, [image.id, image.fwhm, image.star_count, image.image_type, image.file_path]);
@@ -133,8 +137,8 @@ export function DetailPanel({ image, onClose, onQualityComputed }: Props) {
               <p className="text-xs text-gray-500 italic">Analysing…</p>
             ) : (
               <>
-                <Row label="FWHM" value={(qualityFwhm ?? image.fwhm) != null ? `${(qualityFwhm ?? image.fwhm)!.toFixed(2)}"` : null} />
-                <Row label="Eccentricity" value={image.eccentricity?.toFixed(3)} />
+                <Row label="FWHM" value={(qualityFwhm ?? image.fwhm) != null ? `${(qualityFwhm ?? image.fwhm)!.toFixed(2)} px` : null} />
+                <Row label="Eccentricity" value={(qualityEcc ?? image.eccentricity) != null ? (qualityEcc ?? image.eccentricity)!.toFixed(3) : null} />
                 <Row label="Stars" value={(qualityStars ?? image.star_count)?.toLocaleString()} />
                 <Row label="SNR" value={image.snr?.toFixed(1)} />
                 <Row label="Sky bg" value={detail?.sky_background?.toFixed(2)} />
