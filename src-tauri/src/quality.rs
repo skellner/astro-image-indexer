@@ -46,11 +46,10 @@ pub fn analyse_stars(buf: &PixelBuffer) -> Option<(f64, f64, i64)> {
     let mut measurements: Vec<(f32, f32)> = peaks
         .iter()
         .filter_map(|&(x, y)| {
-            let fwhm = measure_fwhm(&crop, cw, ch, x, y, background)?;
+            let (fwhm, ecc) = measure_fwhm_and_eccentricity(&crop, cw, ch, x, y, background)?;
             if !(1.5..=25.0).contains(&fwhm) {
                 return None;
             }
-            let ecc = measure_eccentricity(&crop, cw, ch, x, y, background).unwrap_or(0.0);
             Some((fwhm, ecc))
         })
         .collect();
@@ -150,17 +149,27 @@ fn find_local_maxima(
 }
 
 // ---------------------------------------------------------------------------
-// FWHM measurement for a single star
+// FWHM + eccentricity measurement for a single star
 // ---------------------------------------------------------------------------
 
-fn measure_fwhm(
+/// Measure FWHM and eccentricity for a single star using axis-profile walks.
+///
+/// Walks outward from the peak in the horizontal and vertical directions to
+/// the half-maximum level (sub-pixel interpolated).  Returns the mean FWHM
+/// and the PixInsight-compatible eccentricity derived from the axis ratio:
+///
+///   e = √(1 − (b / a)²)
+///
+/// where `a = max(fwhm_h, fwhm_v)` and `b = min(fwhm_h, fwhm_v)`.
+/// A perfectly round star gives e = 0; a point-source line gives e → 1.
+fn measure_fwhm_and_eccentricity(
     pixels: &[f32],
     width: usize,
     height: usize,
     cx: usize,
     cy: usize,
     background: f32,
-) -> Option<f32> {
+) -> Option<(f32, f32)> {
     let v_peak = pixels[cy * width + cx];
     let v_half = background + (v_peak - background) * 0.5;
     if v_half <= background {
@@ -172,13 +181,12 @@ fn measure_fwhm(
         for d in 1usize..=30 {
             let nx = (cx as i32 + dx * d as i32) as usize;
             let ny = (cy as i32 + dy * d as i32) as usize;
-            // Bounds check — should never trigger given MARGIN, but be safe
             if nx >= width || ny >= height {
                 return d as f32;
             }
             let curr = pixels[ny * width + nx];
             if curr < v_half {
-                // Linear interpolation for sub-pixel accuracy
+                // Sub-pixel interpolation
                 let frac = (prev - v_half) / (prev - curr).max(f32::EPSILON);
                 return (d - 1) as f32 + frac;
             }
@@ -187,92 +195,21 @@ fn measure_fwhm(
         30.0
     };
 
-    let fwhm_h = walk(1, 0) + walk(-1, 0);
-    let fwhm_v = walk(0, 1) + walk(0, -1);
-    Some((fwhm_h + fwhm_v) * 0.5)
-}
+    let fwhm_h = walk(1, 0) + walk(-1, 0); // horizontal full-width
+    let fwhm_v = walk(0, 1) + walk(0, -1); // vertical full-width
+    let mean_fwhm = (fwhm_h + fwhm_v) * 0.5;
 
-// ---------------------------------------------------------------------------
-// Eccentricity measurement for a single star
-// ---------------------------------------------------------------------------
+    // Eccentricity from axis FWHM ratio — matches PixInsight SubframeSelector.
+    let a = fwhm_h.max(fwhm_v); // major axis
+    let b = fwhm_h.min(fwhm_v); // minor axis
+    let ecc = if a > 0.0 {
+        let r = b / a;
+        (1.0 - r * r).max(0.0).sqrt()
+    } else {
+        0.0
+    };
 
-/// Compute eccentricity via intensity-weighted second-order central moments.
-///
-/// The 2×2 covariance matrix of the star's light distribution has eigenvalues
-/// λ_max ≥ λ_min.  The semi-axes are proportional to √λ, so:
-///
-///   eccentricity = √(1 − λ_min / λ_max)
-///
-/// Returns 0 for a perfectly round star and approaches 1 for a line.
-fn measure_eccentricity(
-    pixels: &[f32],
-    width: usize,
-    height: usize,
-    cx: usize,
-    cy: usize,
-    background: f32,
-) -> Option<f32> {
-    let v_peak = pixels[cy * width + cx];
-    let v_thresh = background + (v_peak - background) * 0.5;
-    if v_thresh <= background {
-        return None;
-    }
-
-    let radius: usize = 12;
-    let x0 = cx.saturating_sub(radius);
-    let x1 = (cx + radius + 1).min(width);
-    let y0 = cy.saturating_sub(radius);
-    let y1 = (cy + radius + 1).min(height);
-
-    // Pass 1: intensity-weighted centroid (more accurate than the raw peak).
-    let mut sum_w = 0.0f64;
-    let mut sum_wx = 0.0f64;
-    let mut sum_wy = 0.0f64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let v = pixels[y * width + x] as f64;
-            if v < v_thresh as f64 { continue; }
-            let w = v - background as f64;
-            sum_w  += w;
-            sum_wx += w * x as f64;
-            sum_wy += w * y as f64;
-        }
-    }
-    if sum_w <= 0.0 { return None; }
-    let cx_f = sum_wx / sum_w;
-    let cy_f = sum_wy / sum_w;
-
-    // Pass 2: intensity-weighted second-order central moments.
-    let mut mu_xx = 0.0f64;
-    let mut mu_yy = 0.0f64;
-    let mut mu_xy = 0.0f64;
-    for y in y0..y1 {
-        for x in x0..x1 {
-            let v = pixels[y * width + x] as f64;
-            if v < v_thresh as f64 { continue; }
-            let w  = v - background as f64;
-            let dx = x as f64 - cx_f;
-            let dy = y as f64 - cy_f;
-            mu_xx += w * dx * dx;
-            mu_yy += w * dy * dy;
-            mu_xy += w * dx * dy;
-        }
-    }
-    mu_xx /= sum_w;
-    mu_yy /= sum_w;
-    mu_xy /= sum_w;
-
-    // Eigenvalues of the covariance matrix [[mu_xx, mu_xy], [mu_xy, mu_yy]].
-    let trace = mu_xx + mu_yy;
-    let det   = mu_xx * mu_yy - mu_xy * mu_xy;
-    let disc  = ((trace * trace) / 4.0 - det).max(0.0);
-    let lambda_max = trace / 2.0 + disc.sqrt();
-    let lambda_min = trace / 2.0 - disc.sqrt();
-
-    if lambda_max <= 0.0 || lambda_min < 0.0 { return None; }
-
-    let ecc = (1.0 - lambda_min / lambda_max).sqrt() as f32;
-    if ecc.is_finite() && (0.0..=1.0).contains(&ecc) { Some(ecc) } else { None }
+    Some((mean_fwhm, ecc))
 }
 
 // ---------------------------------------------------------------------------
